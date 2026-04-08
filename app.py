@@ -3,6 +3,7 @@ Mitcham CC junior stats — Streamlit front-end for play.cricket.com.au (Playwri
 """
 
 import base64
+import calendar
 import html
 from datetime import date
 from pathlib import Path
@@ -50,6 +51,34 @@ def _truncate(s: str, max_len: int) -> str:
     if len(s) <= max_len:
         return s
     return s[: max_len - 1] + "…"
+
+
+def _last_day_of_month(d: date) -> date:
+    last = calendar.monthrange(d.year, d.month)[1]
+    return date(d.year, d.month, last)
+
+
+_DEFAULT_START_DATE = date(2025, 10, 1)
+
+
+def _init_date_range_session_state() -> None:
+    if "start_date" not in st.session_state:
+        st.session_state["start_date"] = _DEFAULT_START_DATE
+    if "end_date" not in st.session_state:
+        st.session_state["end_date"] = _last_day_of_month(
+            st.session_state["start_date"]
+        )
+    if "end_date_manually_set" not in st.session_state:
+        st.session_state["end_date_manually_set"] = False
+    if "_prev_start_date" not in st.session_state:
+        st.session_state["_prev_start_date"] = st.session_state["start_date"]
+
+
+def _on_end_date_changed() -> None:
+    """User edited end date — stop auto-overwriting from start date."""
+    if st.session_state.get("_fb_syncing_end_from_start"):
+        return
+    st.session_state["end_date_manually_set"] = True
 
 
 @st.cache_data(ttl=86_400, show_spinner="Loading season list…")
@@ -224,6 +253,8 @@ st.markdown(
 if "teams_cache" not in st.session_state:
     st.session_state["teams_cache"] = {}
 
+_init_date_range_session_state()
+
 logo_uri = _logo_data_uri()
 logo_html = (
     f'<div class="mcc-logo-cell"><img src="{logo_uri}" alt="Mitcham Cricket Club" /></div>'
@@ -249,9 +280,19 @@ t1, t2, t3, t4, t5, t6 = st.columns([2.0, 1.05, 1.05, 0.95, 0.95, 1.05])
 with t1:
     season = st.selectbox("Season", options=season_options, index=0)
 with t2:
-    d0 = st.date_input("Start date", value=date(2025, 10, 1))
+    d0 = st.date_input("Start date", key="start_date")
+sd = st.session_state["start_date"]
+pr = st.session_state["_prev_start_date"]
+if sd != pr:
+    if not st.session_state["end_date_manually_set"]:
+        st.session_state["_fb_syncing_end_from_start"] = True
+        try:
+            st.session_state["end_date"] = _last_day_of_month(sd)
+        finally:
+            st.session_state["_fb_syncing_end_from_start"] = False
+    st.session_state["_prev_start_date"] = sd
 with t3:
-    d1 = st.date_input("End date", value=date(2026, 3, 31))
+    d1 = st.date_input("End date", key="end_date", on_change=_on_end_date_changed)
 with t4:
     min_runs = st.number_input("Min runs", min_value=0, max_value=400, value=20, step=1)
 with t5:

@@ -2977,44 +2977,167 @@ def run_report(
     }
 
 
+_FACEBOOK_JUNK_FRAGMENTS: tuple[str, ...] = (
+    "play cricket",
+    "playcricket app",
+    "fall of wickets",
+    "scorecard",
+    "ball by ball",
+    "graphs",
+    "summary",
+)
+
+
+def _facebook_strip_junk_text(s: str) -> str:
+    t = re.sub(r"\s+", " ", (s or "").strip())
+    if not t or t in ("—", "-"):
+        return ""
+    low = t.lower()
+    if any(j in low for j in _FACEBOOK_JUNK_FRAGMENTS):
+        return ""
+    if "|" in t:
+        parts = [p.strip() for p in t.split("|") if p.strip()]
+        for p in parts:
+            pl = p.lower()
+            if not any(j in pl for j in _FACEBOOK_JUNK_FRAGMENTS) and len(p) >= 3:
+                t = p
+                break
+    return t[:80].strip()
+
+
+def _facebook_compact_grade_label(mitcham_team: str) -> str:
+    """
+    'Mitcham U14 (2) U14 - 6 (SEDA)' -> 'U14 (2)'; fallback 'U14' from first grade token.
+    """
+    s = re.sub(r"\s+", " ", (mitcham_team or "").strip())
+    if not s:
+        return "Mitcham"
+    m = re.search(
+        r"(?i)\bU\s*/?\s*(10|12|14|16|18)\s*\((\d+)\)",
+        s,
+    )
+    if m:
+        return f"U{m.group(1)} ({m.group(2)})"
+    m = re.search(r"(?i)\bU\s*/?\s*(10|12|14|16|18)\b", s)
+    if m:
+        return f"U{m.group(1)}"
+    if _mitcham_in_string(s):
+        return "Mitcham"
+    return s[:24] if len(s) > 24 else s
+
+
+def _facebook_short_opponent(opponent: str) -> str:
+    o = _facebook_strip_junk_text(opponent)
+    if not o:
+        return "Opposition"
+    o = re.split(r"\s+vs\.?\s+|\s+v\.?\s+", o, maxsplit=1, flags=re.I)[0].strip()
+    return o[:56].rstrip(" -–|") if o else "Opposition"
+
+
+def _facebook_mitcham_won_result(result: str) -> bool | None:
+    low = (result or "").lower().strip()
+    if low.startswith("won by") or low == "won":
+        return True
+    if low.startswith("lost by") or low == "lost":
+        return False
+    return None
+
+
+def _facebook_match_result_line(row: dict[str, Any]) -> str:
+    """One social-ready line; scores omitted (not present on match_rows without scraper changes)."""
+    grade = _facebook_compact_grade_label(str(row.get("mitcham_team") or ""))
+    opp = _facebook_short_opponent(str(row.get("opponent") or ""))
+    res = str(row.get("result") or "").strip()
+    status = str(row.get("status") or "").strip()
+    won = _facebook_mitcham_won_result(res)
+
+    if won is True:
+        return f"{grade} - Mitcham d. {opp}"
+    if won is False:
+        return f"{grade} - {opp} d. Mitcham"
+    low = res.lower()
+    if "tie" in low or status == "Completed" and ("draw" in low or "tie" in low):
+        return f"{grade} - Mitcham vs {opp} — {res or 'Draw'}"
+    if status == "In progress":
+        return f"{grade} - Mitcham vs {opp} — In progress"
+    if res and res != "—":
+        return f"{grade} - Mitcham vs {opp} — {res}"
+    return f"{grade} - Mitcham vs {opp}"
+
+
+def _facebook_batting_lines(bh: list[dict[str, Any]], limit: int = 30) -> list[str]:
+    rows = sorted(
+        bh,
+        key=lambda r: (-int(r.get("runs") or 0), str(r.get("player") or "").lower()),
+    )
+    out: list[str] = []
+    for r in rows[:limit]:
+        name = str(r.get("player") or "").strip()
+        runs = int(r.get("runs") or 0)
+        if not name:
+            continue
+        suffix = " no" if r.get("not_out") else ""
+        out.append(f"{name} {runs}{suffix}")
+    return out
+
+
+def _facebook_bowling_combined_lines(bo: list[dict[str, Any]], limit: int = 30) -> list[str]:
+    """Same player, multiple spells: 'Name 3/22 & 2/18'. Sort by best spell: wickets desc, runs asc."""
+    by_player: dict[str, list[tuple[int, int]]] = {}
+    for r in bo:
+        name = str(r.get("player") or "").strip()
+        if not name:
+            continue
+        w = int(r.get("wickets") or 0)
+        rc = int(r.get("runs_conceded") or 0)
+        by_player.setdefault(name, []).append((w, rc))
+    ranked: list[tuple[int, int, str, str]] = []
+    for name, spells in by_player.items():
+        spells_sorted = sorted(spells, key=lambda t: (-t[0], t[1]))
+        fig = " & ".join(f"{w}/{r}" for w, r in spells_sorted)
+        best_w, best_r = spells_sorted[0]
+        ranked.append((best_w, best_r, name, f"{name} {fig}"))
+    ranked.sort(key=lambda x: (-x[0], x[1], x[2].lower()))
+    return [x[3] for x in ranked[:limit]]
+
+
 def facebook_summary(data: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append("Mitcham Cricket Club — Junior wrap")
-    lines.append(f"Season: {data.get('season', '')}")
-    lines.append(f"{data['date_from']} to {data['date_to']}")
     lines.append("")
-    lines.append(data.get("summary_sentence") or "")
+    intro = (data.get("summary_sentence") or "").strip()
+    if intro:
+        lines.append(intro)
     lines.append("")
-    lines.append(
-        f"Record: {data['wins']}W / {data['losses']}L / {data['draws']}D / "
-        f"{data.get('in_progress', 0)} in progress"
-    )
-    bh = data.get("batting_highlights") or []
+    lines.append("Here are the results:")
     lines.append("")
-    lines.append(
-        f"Batting (runs ≥ {data.get('min_runs', 20)}):"
-    )
-    if bh:
-        for row in bh[:35]:
-            lines.append(f"• {row['formatted']}")
-        if len(bh) > 35:
-            lines.append(f"… and {len(bh) - 35} more")
+
+    match_rows = list(data.get("match_rows") or [])
+    if match_rows:
+        for row in match_rows[:40]:
+            lines.append(_facebook_match_result_line(row))
+        if len(match_rows) > 40:
+            lines.append(f"… and {len(match_rows) - 40} more matches")
     else:
         lines.append("—")
-    bo_rows = data.get("bowling_highlights") or []
+
+    bh = list(data.get("batting_highlights") or [])
+    bo_rows = list(data.get("bowling_highlights") or [])
+
     lines.append("")
-    lines.append(
-        f"Bowling (wickets ≥ {data.get('min_wickets', 1)}):"
-    )
-    if bo_rows:
-        for row in bo_rows[:35]:
-            lines.append(f"• {row['formatted']}")
-        if len(bo_rows) > 35:
-            lines.append(f"… and {len(bo_rows) - 35} more")
+    lines.append("Best with the ball:")
+    bbowl = _facebook_bowling_combined_lines(bo_rows)
+    if bbowl:
+        lines.append(", ".join(bbowl))
     else:
         lines.append("—")
-    bb = data.get("best_bowl")
+
     lines.append("")
-    if bb:
-        lines.append(f"Best spell (all innings): {bb[0]} – {bb[1]}/{bb[2]}")
+    lines.append("Best with the bat:")
+    bbat = _facebook_batting_lines(bh)
+    if bbat:
+        lines.append(", ".join(bbat))
+    else:
+        lines.append("—")
+
     return "\n".join(lines)
