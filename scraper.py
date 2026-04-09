@@ -305,7 +305,13 @@ def _log_match_validation(
         f"is_valid_mitcham_match={ok!r} "
         f"reject_reason={reject_reason!r}"
     )
-    logger.info(msg)
+    if ok:
+        if _env_truthy("MITCHAM_MATCH_VALIDATION_VERBOSE"):
+            logger.info(msg)
+        else:
+            logger.debug(msg)
+    else:
+        logger.info(msg)
 
 
 def match_status_from_card(card_text: str) -> str:
@@ -1565,32 +1571,50 @@ def _resolve_match_row_fields(
     oc = item["oc"]
     card_m, card_o = parse_match_card_teams(card)
 
+    fh_home = (getattr(rep, "fixture_header_home_team", None) or "").strip()
+    fh_away = (getattr(rep, "fixture_header_away_team", None) or "").strip()
+    dom_fixture_xor = bool(
+        fh_home
+        and fh_away
+        and (
+            _mitcham_in_string(fh_home) ^ _mitcham_in_string(fh_away)
+        )
+    )
+
     blob = (getattr(rep, "raw_match_team_blob", None) or "").strip()
-    vs_m, vs_o = _best_mitcham_opponent_pair_from_blob(blob)
-    pair_m, pair_o = vs_m, vs_o
-    scorecard_candidates = _clean_segments_for_scorecard_header_fallback(blob)
-    scorecard_ordered = _ordered_scorecard_header_candidate_segments(scorecard_candidates)
-    chosen_header_segment = ""
-    header_parsed_pair_log = ""
-    scorecard_header_pair = ""
-    if pair_m is None and pair_o is None:
-        for seg in scorecard_ordered:
-            hm, ho = _parse_teams_from_scorecard_header_blob_validated(seg)
-            if hm and ho:
-                pair_m, pair_o = hm, ho
-                chosen_header_segment = seg
-                scorecard_header_pair = f"({hm!r}, {ho!r})"
-                header_parsed_pair_log = scorecard_header_pair
-                break
-        if not header_parsed_pair_log and scorecard_ordered:
-            header_parsed_pair_log = "(None, None)"
+    if dom_fixture_xor:
+        vs_m, vs_o = None, None
+        pair_m, pair_o = None, None
+        scorecard_candidates: list[str] = []
+        scorecard_ordered: list[str] = []
+        chosen_header_segment = ""
+        header_parsed_pair_log = "(skipped_blob_segments_dom_fixture_ok)"
+        scorecard_header_pair = ""
+    else:
+        vs_m, vs_o = _best_mitcham_opponent_pair_from_blob(blob)
+        pair_m, pair_o = vs_m, vs_o
+        scorecard_candidates = _clean_segments_for_scorecard_header_fallback(blob)
+        scorecard_ordered = _ordered_scorecard_header_candidate_segments(
+            scorecard_candidates
+        )
+        chosen_header_segment = ""
+        header_parsed_pair_log = ""
+        scorecard_header_pair = ""
+        if pair_m is None and pair_o is None:
+            for seg in scorecard_ordered:
+                hm, ho = _parse_teams_from_scorecard_header_blob_validated(seg)
+                if hm and ho:
+                    pair_m, pair_o = hm, ho
+                    chosen_header_segment = seg
+                    scorecard_header_pair = f"({hm!r}, {ho!r})"
+                    header_parsed_pair_log = scorecard_header_pair
+                    break
+            if not header_parsed_pair_log and scorecard_ordered:
+                header_parsed_pair_log = "(None, None)"
 
     disc = (item.get("discovered_team_label") or "").strip()
     mp = (getattr(rep, "mitcham_team_from_page", None) or "").strip()
     ms = (item.get("mitcham_side") or "").strip()
-
-    fh_home = (getattr(rep, "fixture_header_home_team", None) or "").strip()
-    fh_away = (getattr(rep, "fixture_header_away_team", None) or "").strip()
     fh_result = (getattr(rep, "fixture_header_result_text", None) or "").strip()
     fixture_teams_primary = False
     mitch: str | None = None
@@ -3300,9 +3324,9 @@ def _click_innings_toggle(page: Page, label: str) -> None:
 
 
 def _scorecard_extract_log(msg: str) -> None:
-    logger.info("[ScorecardExtract] %s", msg)
     if not _env_truthy("MITCHAM_SCORECARD_DEBUG"):
         return
+    logger.info("[ScorecardExtract] %s", msg)
     try:
         logf = Path(__file__).resolve().parent / "scorecard_extraction.log"
         with logf.open("a", encoding="utf-8") as fh:
@@ -3365,33 +3389,28 @@ def _log_scorecard_report(rep: ScorecardExtractReport) -> None:
     )
 
 
-def scrape_match_scorecard(
+def scrape_match_scorecard_metadata_only(
     page: Page,
     match_url: str,
     match_date: date | None = None,
-) -> tuple[list[BattingRow], list[tuple[str, int, int]], ScorecardExtractReport]:
+) -> ScorecardExtractReport:
     """
-    Mitcham batting from Mitcham-labelled innings; Mitcham bowling from opposition
-    innings. Falls back to heading-based and full-page matrix parsing when chips
-    are absent or tables use role=grid / non-table layouts.
+    Open match, scorecard tab, fixture header + title/blob metadata only (no innings tables).
+    Page left on scorecard for scrape_match_scorecard_batting_bowling when needed.
     """
     rep = ScorecardExtractReport(match_url=match_url, scorecard_reached=False)
-    all_bat: list[BattingRow] = []
-    all_bowl: list[tuple[str, int, int]] = []
-    bat_tables_total = 0
-    bowl_tables_total = 0
 
     try:
         page.goto(match_url, wait_until="domcontentloaded", timeout=120_000)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(350)
         rep.scorecard_reached = True
     except Exception as e:
         rep.note = f"goto_failed:{e!r}"
-        return all_bat, all_bowl, rep
+        return rep
 
     try:
         page.get_by_text("Scorecard", exact=True).first.click(timeout=4000)
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(150)
         rep.scorecard_tab_clicked = True
     except Exception:
         pass
@@ -3399,7 +3418,7 @@ def scrape_match_scorecard(
     ready = _wait_for_scorecard_content(page)
     if not ready:
         rep.note = (rep.note + " scorecard_content_wait_timeout;").strip()
-    page.wait_for_timeout(260)
+    page.wait_for_timeout(180)
 
     try:
         fh_meta = _extract_fixture_header_metadata(page)
@@ -3410,10 +3429,43 @@ def scrape_match_scorecard(
         pass
 
     try:
-        probe = _scorecard_dom_probe(page)
-        _log_scorecard_dom_probe(match_url, probe)
-    except Exception as e:
-        rep.note = (rep.note + f" dom_probe_err:{e!r};").strip()
+        meta = _extract_match_page_metadata(page)
+        rep.raw_match_team_blob = (meta.get("blob") or "").strip()
+        rep.scorecard_result_lines = list(meta.get("resultLines") or [])
+        rep.mitcham_team_from_page = meta.get("mitcham_from_blob")
+        rep.opponent_from_scorecard = meta.get("opponent_from_blob")
+    except Exception:
+        pass
+
+    if _env_truthy("MITCHAM_SCORECARD_DEBUG"):
+        try:
+            probe = _scorecard_dom_probe(page)
+            _log_scorecard_dom_probe(match_url, probe)
+        except Exception as e:
+            rep.note = (rep.note + f" dom_probe_err:{e!r};").strip()
+
+    return rep
+
+
+def scrape_match_scorecard_batting_bowling(
+    page: Page,
+    rep: ScorecardExtractReport,
+) -> tuple[list[BattingRow], list[tuple[str, int, int]], ScorecardExtractReport]:
+    """
+    Batting/bowling extraction only. Page must already be on this match's scorecard.
+    """
+    match_url = rep.match_url
+    all_bat: list[BattingRow] = []
+    all_bowl: list[tuple[str, int, int]] = []
+    bat_tables_total = 0
+    bowl_tables_total = 0
+
+    if _env_truthy("MITCHAM_SCORECARD_DEBUG"):
+        try:
+            probe = _scorecard_dom_probe(page)
+            _log_scorecard_dom_probe(match_url, probe)
+        except Exception as e:
+            rep.note = (rep.note + f" dom_probe_err:{e!r};").strip()
 
     toggles = _merge_innings_toggle_labels(
         _discover_innings_toggle_labels(page),
@@ -3494,6 +3546,7 @@ def scrape_match_scorecard(
         except Exception:
             pass
 
+    # Match legacy full-parse order: page metadata after innings navigation.
     try:
         meta = _extract_match_page_metadata(page)
         rep.raw_match_team_blob = (meta.get("blob") or "").strip()
@@ -3504,6 +3557,20 @@ def scrape_match_scorecard(
         pass
 
     return all_bat, all_bowl, rep
+
+
+def scrape_match_scorecard(
+    page: Page,
+    match_url: str,
+    match_date: date | None = None,
+) -> tuple[list[BattingRow], list[tuple[str, int, int]], ScorecardExtractReport]:
+    """
+    Full scorecard: metadata then batting/bowling (same behavior as before refactor).
+    """
+    rep = scrape_match_scorecard_metadata_only(page, match_url, match_date)
+    if not rep.scorecard_reached:
+        return [], [], rep
+    return scrape_match_scorecard_batting_bowling(page, rep)
 
 
 def _fallback_short_innings_labels(page: Page) -> list[str]:
@@ -3743,12 +3810,11 @@ def discover_teams_from_page(page: Page) -> list[TeamRef]:
 def list_matches_for_team(page: Page, team: TeamRef) -> list[tuple[str, str]]:
     """Return (match_url, card_inner_text) for completed and in-progress listings."""
     page.goto(team.grade_url, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(650)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=30_000)
     except Exception:
         pass
-    page.wait_for_timeout(450)
+    page.wait_for_timeout(320)
     # Snapshot links in one evaluate — avoids count()+nth(i) timeouts when the DOM
     # updates or count() overshoots visible / stable nodes.
     raw_rows: list[dict[str, str]] = page.evaluate(
@@ -3816,14 +3882,16 @@ def _log_bowling_match_extraction(
         f"parsed_first20={bowls[:20]!r} total_bowling_rows={len(bowls)} "
         f"min_wickets={min_wickets}"
     )
-    logger.info(msg)
     if _env_truthy("MITCHAM_BOWLING_EXTRACTION_DEBUG"):
+        logger.info(msg)
         try:
             logf = Path(__file__).resolve().parent / "bowling_extraction.log"
             with logf.open("a", encoding="utf-8") as fh:
                 fh.write(msg + "\n")
         except Exception:
             pass
+    else:
+        logger.debug(msg)
 
 
 def _log_fetch_scope(payload: dict[str, Any]) -> None:
@@ -3837,6 +3905,15 @@ def _log_fetch_scope(payload: dict[str, Any]) -> None:
         pass
 
 
+def _normalize_bowling_agg_tuple(
+    t: tuple[str, int, int, str, str] | tuple[str, int, int, str, str, str],
+) -> tuple[str, int, int, str, str, str]:
+    """Ensure 6-tuple (…, mitcham_team) for bowling aggregate rows."""
+    if len(t) >= 6:
+        return (t[0], t[1], t[2], t[3], t[4], str(t[5] or ""))
+    return (t[0], t[1], t[2], t[3], t[4], "")
+
+
 def run_report(
     season_label: str,
     date_from: date,
@@ -3848,6 +3925,10 @@ def run_report(
     include_juniors: bool = True,
     include_seniors: bool = False,
     teams_cache: dict[str, list[TeamRef]] | None = None,
+    scorecard_cache: dict[
+        str, tuple[list[BattingRow], list[tuple[str, int, int]], ScorecardExtractReport]
+    ]
+    | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if not include_juniors and not include_seniors:
@@ -3879,13 +3960,14 @@ def run_report(
     agg_bowl_rows = 0
     agg_bat_pass_min = 0
     agg_bowl_pass_min = 0
-    all_bowling_agg: list[tuple[str, int, int, str, str]] = []
+    all_bowling_agg: list[tuple[str, int, int, str, str, str]] = []
 
     def prog(msg: str) -> None:
         if progress_callback:
             progress_callback(msg)
 
     cache = teams_cache if teams_cache is not None else {}
+    scorecard_store = scorecard_cache if scorecard_cache is not None else {}
     cache_key = season_label
     t_total = time.perf_counter()
     selected_teams: list[TeamRef] = []
@@ -3956,6 +4038,7 @@ def run_report(
             per_team_raw_matches: dict[str, int] = {}
             t1 = time.perf_counter()
             prog(f"Scanning fixtures ({len(selected_teams)} teams)…")
+            match_discovery_attempts = 0
             for attempt in range(3):
                 for team in selected_teams:
                     tc = classify_team_label(team.label)
@@ -3989,13 +4072,15 @@ def run_report(
                             "discovered_team_label": team.label,
                             "team_category": tc,
                         }
+                c_now = len(by_url)
+                match_discovery_attempts = attempt + 1
                 logger.info(
                     "match_count_attempt_%d=%d",
                     attempt + 1,
-                    len(by_url),
+                    c_now,
                 )
                 if attempt < 2:
-                    page.wait_for_timeout(650)
+                    page.wait_for_timeout(400)
             logger.info("final_match_count=%d", len(by_url))
             _perf("match discovery (date-filtered)", t1)
 
@@ -4019,7 +4104,7 @@ def run_report(
                     "cache_key": cache_key,
                     "total_matches_fetched": n_m,
                     "final_match_count": n_m,
-                    "match_discovery_attempts": 3,
+                    "match_discovery_attempts": match_discovery_attempts,
                     "matches_junior": n_matches_junior,
                     "matches_senior_men": n_matches_senior_men,
                     "matches_senior_women": n_matches_senior_women,
@@ -4036,13 +4121,13 @@ def run_report(
                 oc = item["oc"]
                 disc_lab = item.get("discovered_team_label") or ""
 
-                bats, bowls, _rep = scrape_match_scorecard(page, match_url, md)
-                resolved = _resolve_match_row_fields(item, _rep)
+                _rep = scrape_match_scorecard_metadata_only(page, match_url, md)
+                resolved_pre = _resolve_match_row_fields(item, _rep)
                 ok, rej = is_valid_mitcham_match(
-                    _rep, resolved, item.get("card") or ""
+                    _rep, resolved_pre, item.get("card") or ""
                 )
                 _log_match_validation(
-                    match_url, disc_lab, _rep, resolved, ok, rej
+                    match_url, disc_lab, _rep, resolved_pre, ok, rej
                 )
                 if not ok:
                     team_rejected[disc_lab] += 1
@@ -4051,6 +4136,21 @@ def run_report(
                     continue
 
                 team_accepted[disc_lab] += 1
+
+                bats: list[BattingRow] = []
+                bowls: list[tuple[str, int, int]] = []
+                _rep_final: ScorecardExtractReport = _rep
+                if status == "Completed":
+                    if match_url in scorecard_store:
+                        bats, bowls, _rep_final = scorecard_store[match_url]
+                    else:
+                        bats, bowls, _rep_final = (
+                            scrape_match_scorecard_batting_bowling(page, _rep)
+                        )
+                        scorecard_store[match_url] = (bats, bowls, _rep_final)
+                    resolved = _resolve_match_row_fields(item, _rep_final)
+                else:
+                    resolved = resolved_pre
 
                 if status == "Completed":
                     if oc == "win":
@@ -4062,36 +4162,39 @@ def run_report(
                 elif status == "In progress":
                     in_progress += 1
 
-                if status == "Completed":
-                    _log_scorecard_report(_rep)
-                    logger.info(
-                        "[ScorecardInningsChips] detected=%r mitcham=%r opposition=%r",
-                        _rep.innings_chips_detected,
-                        _rep.mitcham_innings_chips,
-                        _rep.opposition_innings_chips,
-                    )
-                    _log_bowling_match_extraction(_rep, bowls, min_wickets)
-                agg_bat_rows += len(bats)
-                agg_bowl_rows += len(bowls)
-                agg_bat_pass_min += sum(1 for br in bats if br.runs >= min_runs)
                 ds = md.isoformat() if md else ""
-                for br in bats:
-                    if br.runs >= min_runs:
-                        batting_highlights.append(
-                            {
-                                "date": ds,
-                                "player": br.player,
-                                "runs": br.runs,
-                                "balls": br.balls,
-                                "not_out": br.not_out,
-                                "formatted": format_batting_display(br),
-                                "match_url": match_url,
-                            }
+                if status == "Completed":
+                    _log_scorecard_report(_rep_final)
+                    if _env_truthy("MITCHAM_SCORECARD_DEBUG"):
+                        logger.info(
+                            "[ScorecardInningsChips] detected=%r mitcham=%r opposition=%r",
+                            _rep_final.innings_chips_detected,
+                            _rep_final.mitcham_innings_chips,
+                            _rep_final.opposition_innings_chips,
                         )
-                for name, wkts, runs_con in bowls:
-                    all_bowling_agg.append(
-                        (name, wkts, runs_con, ds, match_url)
-                    )
+                    _log_bowling_match_extraction(_rep_final, bowls, min_wickets)
+                    agg_bat_rows += len(bats)
+                    agg_bowl_rows += len(bowls)
+                    agg_bat_pass_min += sum(1 for br in bats if br.runs >= min_runs)
+                    mt = str(resolved.get("mitcham_team") or "").strip() or "Mitcham"
+                    for br in bats:
+                        if br.runs >= min_runs:
+                            batting_highlights.append(
+                                {
+                                    "date": ds,
+                                    "player": br.player,
+                                    "runs": br.runs,
+                                    "balls": br.balls,
+                                    "not_out": br.not_out,
+                                    "formatted": format_batting_display(br),
+                                    "match_url": match_url,
+                                    "mitcham_team": mt,
+                                }
+                            )
+                    for name, wkts, runs_con in bowls:
+                        all_bowling_agg.append(
+                            (name, wkts, runs_con, ds, match_url, mt)
+                        )
 
                 match_rows.append(
                     {
@@ -4139,6 +4242,8 @@ def run_report(
         finally:
             browser.close()
 
+    all_bowling_agg = [_normalize_bowling_agg_tuple(t) for t in all_bowling_agg]
+
     bowling_highlights = [
         {
             "date": t[3],
@@ -4147,6 +4252,7 @@ def run_report(
             "runs_conceded": t[2],
             "formatted": format_bowling_display(t[0], t[1], t[2]),
             "match_url": t[4],
+            "mitcham_team": t[5],
         }
         for t in all_bowling_agg
         if t[1] >= min_wickets
@@ -4157,17 +4263,17 @@ def run_report(
     _filt20 = [x for x in all_bowling_agg if x[1] >= min_wickets][:20]
     _disp20 = [
         format_bowling_display(name, w, r)
-        for name, w, r, _ds, _u in _filt20
+        for name, w, r, _ds, _u, _mt in _filt20
     ]
-    logger.info(
-        "[BowlingAggregate] total_bowling_rows=%d min_wickets=%s "
-        "first20_agg=%r first20_after_filter=%r display_strings=%r",
-        len(all_bowling_agg),
-        min_wickets,
-        all_bowling_agg[:20],
-        _filt20,
-        _disp20,
+    _bowl_agg_msg = (
+        f"[BowlingAggregate] total_bowling_rows={len(all_bowling_agg)} "
+        f"min_wickets={min_wickets} first20_agg={all_bowling_agg[:20]!r} "
+        f"first20_after_filter={_filt20!r} display_strings={_disp20!r}"
     )
+    if _env_truthy("MITCHAM_BOWLING_EXTRACTION_DEBUG"):
+        logger.info(_bowl_agg_msg)
+    else:
+        logger.debug(_bowl_agg_msg)
     if _env_truthy("MITCHAM_BOWLING_EXTRACTION_DEBUG"):
         try:
             logf = Path(__file__).resolve().parent / "bowling_extraction.log"
@@ -4182,10 +4288,20 @@ def run_report(
     _perf("total fetch", t_total)
 
     batting_highlights.sort(
-        key=lambda r: (-r["runs"], r["balls"], r["player"].lower())
+        key=lambda r: (
+            (r.get("mitcham_team") or "").lower(),
+            -int(r.get("runs") or 0),
+            int(r.get("balls") or 0),
+            str(r.get("player") or "").lower(),
+        )
     )
     bowling_highlights.sort(
-        key=lambda r: (-r["wickets"], r["runs_conceded"], r["player"].lower())
+        key=lambda r: (
+            (r.get("mitcham_team") or "").lower(),
+            -int(r.get("wickets") or 0),
+            int(r.get("runs_conceded") or 0),
+            str(r.get("player") or "").lower(),
+        )
     )
     match_rows.sort(key=lambda r: (r["date"] or "", r["mitcham_team"]))
 

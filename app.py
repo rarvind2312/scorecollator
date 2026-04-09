@@ -5,7 +5,10 @@ Mitcham CC junior stats — Streamlit front-end for play.cricket.com.au (Playwri
 import base64
 import calendar
 import html
+import re
 from datetime import date
+from itertools import groupby
+from typing import Literal
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +39,68 @@ def _highlight_card(title: str, lines: list[str], empty_msg: str) -> str:
     )
 
 
+def _highlight_card_grouped_by_team(
+    title: str,
+    highlights: list[dict],
+    empty_msg: str,
+    *,
+    kind: Literal["bat", "bowl"],
+) -> str:
+    """Group formatted highlight lines under final Mitcham team names."""
+    if not highlights:
+        return (
+            f'<div class="highlight-card">'
+            f"<h4>{html.escape(title)}</h4>"
+            f"<p style='color:#2a3d3a;margin:0'>{html.escape(empty_msg)}</p>"
+            f"</div>"
+        )
+    if kind == "bat":
+        sort_key = lambda r: (
+            (r.get("mitcham_team") or "").lower(),
+            -int(r.get("runs") or 0),
+            int(r.get("balls") or 0),
+            str(r.get("player") or "").lower(),
+        )
+    else:
+        sort_key = lambda r: (
+            (r.get("mitcham_team") or "").lower(),
+            -int(r.get("wickets") or 0),
+            int(r.get("runs_conceded") or 0),
+            str(r.get("player") or "").lower(),
+        )
+    rows = sorted(highlights, key=sort_key)
+
+    def _team_key(r: dict) -> str:
+        t = (r.get("mitcham_team") or "").strip()
+        return t if t else "Mitcham"
+
+    blocks: list[str] = []
+    for team, group in groupby(rows, key=_team_key):
+        lines = [html.escape(str(r.get("formatted") or "")) for r in group]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            continue
+        blocks.append(
+            f'<p class="highlight-team-name">{html.escape(team)}</p>'
+            "<ul>"
+            + "".join(f"<li>{ln}</li>" for ln in lines)
+            + "</ul>"
+        )
+    if not blocks:
+        return (
+            f'<div class="highlight-card">'
+            f"<h4>{html.escape(title)}</h4>"
+            f"<p style='color:#2a3d3a;margin:0'>{html.escape(empty_msg)}</p>"
+            f"</div>"
+        )
+    body = "".join(blocks)
+    return (
+        f'<div class="highlight-card">'
+        f"<h4>{html.escape(title)}</h4>"
+        f"{body}</div>"
+    )
+
+
 def _logo_data_uri() -> Optional[str]:
     for path in (_LOGO_PNG, _LOGO_WEBP):
         if path.exists():
@@ -59,6 +124,20 @@ def _last_day_of_month(d: date) -> date:
 
 
 _DEFAULT_START_DATE = date(2025, 10, 1)
+
+
+def _season_first_year_oct_range(label: str) -> tuple[date, date]:
+    """
+    First calendar year in a PlayCricket-style label, e.g. 'Summer 2025/26' -> Oct 1–Oct 31 2025.
+    """
+    m = re.search(r"Summer\s+(\d{4})/", (label or "").strip())
+    if not m:
+        d0 = _DEFAULT_START_DATE
+        return d0, _last_day_of_month(d0)
+    y = int(m.group(1))
+    start = date(y, 10, 1)
+    end = date(y, 10, 31)
+    return start, end
 
 
 def _init_date_range_session_state() -> None:
@@ -249,6 +328,17 @@ st.markdown(
     .highlight-card li {
       color: #1a2e2c !important;
     }
+    .highlight-team-name {
+      font-family: Palatino, Georgia, serif;
+      font-size: 1.0rem;
+      font-weight: 700;
+      color: #0c4a45 !important;
+      margin: 0.75rem 0 0.35rem 0;
+      -webkit-text-fill-color: #0c4a45 !important;
+    }
+    .highlight-card .highlight-team-name:first-of-type {
+      margin-top: 0.35rem;
+    }
     .section-heading {
       font-family: Palatino, Georgia, serif;
       font-size: 1.15rem;
@@ -288,6 +378,8 @@ if "teams_cache" not in st.session_state:
 if st.session_state.get("teams_cache_schema_v") != 2:
     st.session_state["teams_cache"] = {}
     st.session_state["teams_cache_schema_v"] = 2
+if "scorecard_cache" not in st.session_state:
+    st.session_state["scorecard_cache"] = {}
 
 _init_date_range_session_state()
 
@@ -311,12 +403,40 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-season_options = list(_cached_season_labels())
-if not season_options:
-    season_options = list(default_season_choices())
+# Full list only — never derive from the current selection (avoids shrinking the dropdown).
+full_season_options = list(_cached_season_labels()) or list(default_season_choices())
+st.session_state["season_options"] = list(full_season_options)
+
+if "selected_season" not in st.session_state:
+    st.session_state["selected_season"] = (
+        full_season_options[0] if full_season_options else ""
+    )
+elif (
+    st.session_state["selected_season"] not in full_season_options
+    and full_season_options
+):
+    st.session_state["selected_season"] = full_season_options[0]
+
 t1, t2, t3, t4, t5, t6 = st.columns([2.0, 1.05, 1.05, 0.95, 0.95, 1.05])
 with t1:
-    season = st.selectbox("Season", options=season_options, index=0)
+    st.selectbox("Season", options=full_season_options, key="selected_season")
+
+if "previous_selected_season" not in st.session_state:
+    st.session_state["previous_selected_season"] = st.session_state["selected_season"]
+elif st.session_state["selected_season"] != st.session_state["previous_selected_season"]:
+    s0, e0 = _season_first_year_oct_range(st.session_state["selected_season"])
+    st.session_state["_fb_syncing_end_from_start"] = True
+    try:
+        st.session_state["start_date"] = s0
+        st.session_state["end_date"] = e0
+        st.session_state["end_date_manually_set"] = False
+        st.session_state["_prev_start_date"] = s0
+    finally:
+        st.session_state["_fb_syncing_end_from_start"] = False
+    st.session_state["previous_selected_season"] = st.session_state["selected_season"]
+
+season = st.session_state["selected_season"]
+
 with t2:
     d0 = st.date_input("Start date", key="start_date")
 sd = st.session_state["start_date"]
@@ -350,6 +470,7 @@ _cur_scope = f"{season}|{d0}|{d1}|{int(include_juniors)}|{int(include_seniors)}"
 _prev_report = st.session_state.get("report")
 if _prev_report is not None and _prev_report.get("fetch_scope_key") != _cur_scope:
     st.session_state.pop("report", None)
+    st.session_state["scorecard_cache"] = {}
 
 if fetch:
     if not include_juniors and not include_seniors:
@@ -371,6 +492,7 @@ if fetch:
                 include_juniors=include_juniors,
                 include_seniors=include_seniors,
                 teams_cache=st.session_state["teams_cache"],
+                scorecard_cache=st.session_state["scorecard_cache"],
                 progress_callback=_prog,
             )
             status.update(label="Fetch completed", state="complete")
@@ -402,19 +524,21 @@ if st.session_state.get("report") is not None:
     bo = data.get("bowling_highlights") or []
     with hb1:
         st.markdown(
-            _highlight_card(
+            _highlight_card_grouped_by_team(
                 "Best with the bat",
-                [r["formatted"] for r in bh],
+                bh,
                 "No performances reached your minimum runs threshold.",
+                kind="bat",
             ),
             unsafe_allow_html=True,
         )
     with hb2:
         st.markdown(
-            _highlight_card(
+            _highlight_card_grouped_by_team(
                 "Best with the ball",
-                [r["formatted"] for r in bo],
+                bo,
                 "No performances reached your minimum wickets threshold.",
+                kind="bowl",
             ),
             unsafe_allow_html=True,
         )
