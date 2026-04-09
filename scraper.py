@@ -8,10 +8,11 @@ import logging
 import os
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Page, sync_playwright
@@ -79,14 +80,136 @@ MONTHS = {
 }
 
 
-def is_junior_team_label(label: str) -> bool:
-    """Under-10/12/14/16/18 style labels (includes U14, U/14, Under 14, etc.)."""
+def is_junior_fast9_or_super7_label(label: str) -> bool:
+    """U10-style Fast 9's / Super 7's competitions — always junior, never senior."""
     s = label or ""
+    if re.search(r"(?i)fast\s*9", s):
+        return True
+    if re.search(r"(?i)super\s*7", s):
+        return True
+    return False
+
+
+def is_junior_team_label(label: str) -> bool:
+    """Under-age and junior-only comps: U10–U18, Stage 1 / Stage 2, Fast 9's, Super 7's, etc."""
+    s = label or ""
+    if is_junior_fast9_or_super7_label(s):
+        return True
     if re.search(r"(?i)\bunder\s*(10|12|14|16|18)\b", s):
         return True
     if re.search(r"(?i)(?<![0-9])u/?\s*(10|12|14|16|18)(?![0-9])", s):
         return True
+    if re.search(r"(?i)\bstage\s*[12]\b", s):
+        return True
     return False
+
+
+TeamCategory = Literal["junior", "senior_men", "senior_women"]
+
+# Senior women: competition/team naming (not junior U12–U18 paths).
+_SENIOR_WOMEN_LABEL_SOURCES: tuple[str, ...] = (
+    r"(?i)\begwc\b",
+    r"(?i)\bsenior\s+women\b",
+    r"(?i)\bwomen'?s?\s+(?:[a-z]\s+)?(?:grade|xi|shield|weekly|premier)\b",
+    r"(?i)\b(?:womens|ladies)\b.*\b(?:xi|grade|shield|weekly|cup)\b",
+    r"(?i)\bfemale\b.*\b(?:xi|grade)\b",
+)
+_SENIOR_WOMEN_LABEL_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(src) for src in _SENIOR_WOMEN_LABEL_SOURCES
+)
+
+# Senior men (open-age): XI, men's, premier, vets — exclude strings already junior or women's senior.
+_SENIOR_MEN_LABEL_SOURCES: tuple[str, ...] = (
+    r"(?i)\b(?:[1-9]|1[0-9])(?:st|nd|rd|th)\s+xi\b",
+    r"(?i)\b(?:first|second|third|fourth|fifth|sixth)\s+xi\b",
+    r"(?i)\b(?:over|o)\s*40\b",
+    r"(?i)\bveterans?\b",
+    r"(?i)\bmasters?\b",
+    r"(?i)\b(?:o\s*40|ov(?:er)?\s*40)\b",
+    r"(?i)\bmen'?s?\b",
+    r"(?i)\bopen\s+age\b",
+    r"(?i)\bpremier\b",
+    r"(?i)\bcolts\b",
+    r"(?i)\bsub[\s-]*district\b",
+)
+_SENIOR_MEN_LABEL_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(src) for src in _SENIOR_MEN_LABEL_SOURCES
+)
+
+# Broad hints for non-junior sides not caught above (legacy).
+_SENIOR_BROAD_HINT_SOURCES: tuple[str, ...] = (
+    r"(?i)\b(?:women|womens|women's|ladies)\b",
+    r"(?i)\b(?:[1-9]|1[0-9])(?:st|nd|rd|th)\s+xi\b",
+    r"(?i)\b(?:first|second|third)\s+xi\b",
+)
+_SENIOR_BROAD_HINT_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(src) for src in _SENIOR_BROAD_HINT_SOURCES
+)
+
+
+def _matches_senior_women_label(label: str) -> bool:
+    s = (label or "").strip()
+    if not s or is_junior_team_label(s):
+        return False
+    return any(rx.search(s) for rx in _SENIOR_WOMEN_LABEL_RES)
+
+
+def _matches_senior_men_label(label: str) -> bool:
+    s = (label or "").strip()
+    if not s or is_junior_team_label(s) or _matches_senior_women_label(s):
+        return False
+    return any(rx.search(s) for rx in _SENIOR_MEN_LABEL_RES)
+
+
+def classify_team_label(label: str) -> TeamCategory:
+    """
+    Single source of truth: junior vs senior men's vs senior women's team labels.
+    """
+    s = (label or "").strip()
+    if not s:
+        return "senior_men"
+    if is_junior_team_label(s):
+        return "junior"
+    if _matches_senior_women_label(s):
+        return "senior_women"
+    if _matches_senior_men_label(s):
+        return "senior_men"
+    low = s.lower()
+    if any(rx.search(s) for rx in _SENIOR_BROAD_HINT_RES):
+        if re.search(r"(?i)(women|womens|women's|ladies|egwc|female|senior\s+women)", low):
+            return "senior_women"
+        return "senior_men"
+    return "senior_men"
+
+
+def is_senior_team_label(label: str) -> bool:
+    """True for senior men's or senior women's sides (not juniors)."""
+    return classify_team_label(label) in ("senior_men", "senior_women")
+
+
+def teams_for_scope(
+    all_teams: list[TeamRef],
+    *,
+    include_juniors: bool,
+    include_seniors: bool,
+) -> list[TeamRef]:
+    """Deduplicate by grade_url; juniors vs seniors (men + women) from classify_team_label."""
+    if not include_juniors and not include_seniors:
+        return []
+    seen: set[str] = set()
+    out: list[TeamRef] = []
+    for t in all_teams:
+        cat = classify_team_label(t.label)
+        take = (include_juniors and cat == "junior") or (
+            include_seniors and cat in ("senior_men", "senior_women")
+        )
+        if not take:
+            continue
+        if t.grade_url in seen:
+            continue
+        seen.add(t.grade_url)
+        out.append(t)
+    return out
 
 
 def _parse_first_match_date(card_text: str) -> date | None:
@@ -108,6 +231,81 @@ def _parse_first_match_date(card_text: str) -> date | None:
 
 def _mitcham_in_string(s: str) -> bool:
     return "mitcham" in (s or "").lower()
+
+
+def is_valid_mitcham_match(
+    rep: Any,
+    resolved: dict[str, Any],
+    card_text: str,
+) -> tuple[bool, str]:
+    """
+    True only when the scorecard clearly involves Mitcham on exactly one side.
+    discovered_team_label must NOT be treated as proof — fixture headers / card win.
+    """
+    fh_home = (getattr(rep, "fixture_header_home_team", None) or "").strip()
+    fh_away = (getattr(rep, "fixture_header_away_team", None) or "").strip()
+
+    if fh_home and fh_away:
+        hm, ha = _mitcham_in_string(fh_home), _mitcham_in_string(fh_away)
+        if not hm and not ha:
+            return False, "fixture_neither_mitcham"
+        if hm and ha:
+            return False, "fixture_both_mitcham"
+        if not (hm ^ ha):
+            return False, "fixture_ambiguous"
+    elif fh_home or fh_away:
+        side = fh_home or fh_away
+        if not _mitcham_in_string(side):
+            return False, "fixture_single_non_mitcham"
+    else:
+        cm, co = parse_match_card_teams(card_text or "")
+        if cm and co and not _mitcham_in_string(cm) and not _mitcham_in_string(co):
+            return False, "card_both_sides_non_mitcham"
+        rm = (resolved.get("resolved_mitcham_team") or "").strip()
+        ro = (resolved.get("resolved_opponent") or "").strip()
+        if rm and ro and ro not in ("—", "-"):
+            if not (
+                _mitcham_in_string(rm)
+                and not _mitcham_in_string(ro)
+                and len(rm) >= 7
+            ):
+                return False, "fallback_resolved_pair_invalid"
+        else:
+            return False, "fixture_missing_incomplete_pair"
+
+    fm = (resolved.get("mitcham_team") or "").strip()
+    fo = (resolved.get("opponent") or "").strip()
+    if not fm or not _mitcham_in_string(fm):
+        return False, "final_mitcham_invalid"
+    if fo in ("—", "-", "") or not str(fo).strip():
+        return False, "final_opponent_empty"
+    if _mitcham_in_string(fo):
+        return False, "final_opponent_is_mitcham"
+    return True, ""
+
+
+def _log_match_validation(
+    url: str,
+    discovered_label: str,
+    rep: Any,
+    resolved: dict[str, Any],
+    ok: bool,
+    reject_reason: str,
+) -> None:
+    msg = (
+        f"[MatchValidation] url={url!r} "
+        f"discovered_team_label={discovered_label!r} "
+        f"fixture_header_home_team={getattr(rep, 'fixture_header_home_team', '')!r} "
+        f"fixture_header_away_team={getattr(rep, 'fixture_header_away_team', '')!r} "
+        f"resolved_mitcham_team={resolved.get('resolved_mitcham_team')!r} "
+        f"resolved_opponent={resolved.get('resolved_opponent')!r} "
+        f"final_mitcham_team={resolved.get('mitcham_team')!r} "
+        f"final_opponent_team={resolved.get('opponent')!r} "
+        f"normalized_result={resolved.get('result')!r} "
+        f"is_valid_mitcham_match={ok!r} "
+        f"reject_reason={reject_reason!r}"
+    )
+    logger.info(msg)
 
 
 def match_status_from_card(card_text: str) -> str:
@@ -333,6 +531,16 @@ def _valid_scorecard_fallback_team_name(name: str | None) -> bool:
     return True
 
 
+def _strip_scorecard_segment_for_team_parse(seg: str) -> str:
+    """Remove trailing result clauses so COMPLETED header parsing can succeed."""
+    t = re.sub(r"\s+", " ", (seg or "").strip())
+    if not t:
+        return t
+    t = re.sub(r"(?i)\s+won\s+by\s+.*$", "", t)
+    t = re.sub(r"(?i)\s+lost\s+by\s+.*$", "", t)
+    return t.strip()
+
+
 def _parse_teams_from_scorecard_header_blob_validated(
     blob: str,
 ) -> tuple[str | None, str | None]:
@@ -522,6 +730,142 @@ def _extract_match_page_metadata(page: Page) -> dict[str, Any]:
     }
 
 
+def _extract_fixture_header_metadata(page: Page) -> dict[str, str]:
+    """
+    Primary scorecard fixture header: team names (overs spans excluded) and result line.
+    """
+    try:
+        raw = page.evaluate(
+            r"""() => {
+          const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+          const teamEls = document.querySelectorAll('div.o-play-match-card__team-name');
+          const teams = [];
+          for (const el of teamEls) {
+            const clone = el.cloneNode(true);
+            for (const ov of clone.querySelectorAll('span.o-play-match-card__team-overs')) {
+              ov.remove();
+            }
+            teams.push(norm(clone.innerText || ''));
+          }
+          const rtEl = document.querySelector('span.o-play-match-card__result-text');
+          const resultText = rtEl ? norm(rtEl.innerText || '') : '';
+          return {
+            homeTeam: teams[0] || '',
+            awayTeam: teams[1] || '',
+            resultText: resultText
+          };
+        }"""
+        )
+    except Exception:
+        return {"homeTeam": "", "awayTeam": "", "resultText": ""}
+    if not isinstance(raw, dict):
+        return {"homeTeam": "", "awayTeam": "", "resultText": ""}
+    return {
+        "homeTeam": str(raw.get("homeTeam") or "").strip(),
+        "awayTeam": str(raw.get("awayTeam") or "").strip(),
+        "resultText": str(raw.get("resultText") or "").strip(),
+    }
+
+
+def _team_name_matches_label(winner: str, label: str | None) -> bool:
+    """True if fixture result winner/loser fragment refers to this team label."""
+    if not winner or not label:
+        return False
+    w = re.sub(r"\s+", " ", winner.strip().lower())
+    l = re.sub(r"\s+", " ", label.strip().lower())
+    if not w or not l:
+        return False
+    if l == w:
+        return True
+    if l in w or w in l:
+        return True
+    if len(l) >= 10 and (l[:22] in w or l[-18:] in w):
+        return True
+    if len(w) >= 10 and (w[:22] in l or w[-18:] in l):
+        return True
+    return False
+
+
+def normalize_fixture_header_result_to_compact(
+    result_text: str,
+    mitcham_team: str | None,
+    opponent_team: str | None,
+    oc: str | None,
+) -> str | None:
+    """
+    Map span.o-play-match-card__result-text to Match Results / Facebook compact result.
+    """
+    t = re.sub(r"\s+", " ", (result_text or "").strip())
+    if not t:
+        return None
+    tl = t.lower()
+    if tl in ("completed", "complete", "—", "-"):
+        return None
+    if "no result" in tl or ("abandoned" in tl and "won" not in tl):
+        return "No result"
+    if re.search(r"\b(tied|scores level)\b", tl):
+        return "Tie"
+    if "match drawn" in tl or (
+        "draw" in tl and "won" not in tl and "won by" not in tl
+    ):
+        return "Draw"
+
+    m = re.search(
+        r"(?is)^(.+)\s+won\s+by\s+(\d+)\s+(runs?|wickets?)\s*\.?\s*$",
+        t,
+    )
+    if m:
+        winner = m.group(1).strip()
+        margin = _normalize_runs_wickets_margin(m.group(2), m.group(3))
+        wm = _team_name_matches_label(winner, mitcham_team)
+        wo = _team_name_matches_label(winner, opponent_team)
+        if wm and not wo:
+            return f"Won by {margin}"
+        if wo and not wm:
+            return f"Lost by {margin}"
+        if _mitcham_in_string(winner):
+            return f"Won by {margin}"
+        return f"Lost by {margin}"
+
+    m2 = re.search(r"(?is)^(.+)\s+won\s*\.?\s*$", t)
+    if m2:
+        winner = m2.group(1).strip()
+        wm = _team_name_matches_label(winner, mitcham_team)
+        wo = _team_name_matches_label(winner, opponent_team)
+        if wm and not wo:
+            return "Won"
+        if wo and not wm:
+            return "Lost"
+        if _mitcham_in_string(winner):
+            return "Won"
+        return "Lost"
+
+    m3 = re.search(
+        r"(?is)^(.+)\s+lost\s+by\s+(\d+)\s+(runs?|wickets?)\s*\.?\s*$",
+        t,
+    )
+    if m3:
+        loser = m3.group(1).strip()
+        margin = _normalize_runs_wickets_margin(m3.group(2), m3.group(3))
+        lm = _team_name_matches_label(loser, mitcham_team)
+        lo = _team_name_matches_label(loser, opponent_team)
+        if lm and not lo:
+            return f"Lost by {margin}"
+        if lo and not lm:
+            return f"Won by {margin}"
+        if _mitcham_in_string(loser):
+            return f"Lost by {margin}"
+        return f"Won by {margin}"
+
+    if oc == "win":
+        return "Won"
+    if oc == "loss":
+        return "Lost"
+    if oc == "draw":
+        return "Draw"
+    return None
+
+
 def parse_match_card_teams(card_text: str) -> tuple[str, str]:
     """Best-effort Mitcham XI name and opponent from the grade match card."""
     vm, vo = _parse_teams_from_card_vs_line(card_text)
@@ -579,24 +923,36 @@ def result_display_from_card(card_text: str, outcome: str | None, status: str) -
     return "—"
 
 
+def _normalize_runs_wickets_margin(n: str, unit: str) -> str:
+    """Canonical '20 runs' / '3 wickets' from regex groups (singular or plural)."""
+    u = unit.lower()
+    if u.startswith("run"):
+        return f"{n} runs"
+    return f"{n} wickets"
+
+
 def _extract_won_by_margin_phrase(s: str) -> str | None:
     """Only the margin part, e.g. '49 runs' — never trailing team names or scores."""
-    m = re.search(r"\bwon\s+by\s+(\d+)\s+(runs|wickets)\b", s, flags=re.I)
+    m = re.search(
+        r"\bwon\s+by\s+(\d+)\s+(runs?|wickets?)\b", s, flags=re.I
+    )
     if not m:
         return None
-    return f"{m.group(1)} {m.group(2).lower()}"
+    return _normalize_runs_wickets_margin(m.group(1), m.group(2))
 
 
 def _extract_lost_by_margin_phrase(s: str) -> str | None:
-    m = re.search(r"\blost\s+by\s+(\d+)\s+(runs|wickets)\b", s, flags=re.I)
+    m = re.search(
+        r"\blost\s+by\s+(\d+)\s+(runs?|wickets?)\b", s, flags=re.I
+    )
     if not m:
         return None
-    return f"{m.group(1)} {m.group(2).lower()}"
+    return _normalize_runs_wickets_margin(m.group(1), m.group(2))
 
 
 def _winner_text_before_strict_won_by(s: str) -> str | None:
     s = re.sub(r"\s+", " ", (s or "").strip())
-    m = re.search(r"\bwon\s+by\s+\d+\s+(runs|wickets)\b", s, flags=re.I)
+    m = re.search(r"\bwon\s+by\s+\d+\s+(runs?|wickets?)\b", s, flags=re.I)
     if not m:
         return None
     before = s[: m.start()].strip()
@@ -671,6 +1027,48 @@ def _compact_result_from_line(
     return None
 
 
+def _infer_result_from_broad_blob(
+    card_text: str,
+    page_result_lines: list[str],
+    oc: str | None,
+    mitcham_team: str | None,
+    opponent: str | None,
+) -> str | None:
+    """When line-by-line parsing missed 'won by', scan full card + result lines."""
+    blob = re.sub(
+        r"\s+",
+        " ",
+        (card_text or "") + " " + " ".join(page_result_lines or []),
+    )
+    if not blob.strip():
+        return None
+    m = re.search(
+        r"\bwon\s+by\s+(\d+)\s+(runs?|wickets?)\b", blob, flags=re.I
+    )
+    if not m:
+        lm = re.search(
+            r"\blost\s+by\s+(\d+)\s+(runs?|wickets?)\b", blob, flags=re.I
+        )
+        if not lm:
+            return None
+        margin = _normalize_runs_wickets_margin(lm.group(1), lm.group(2))
+        return f"Lost by {margin}"
+    margin = _normalize_runs_wickets_margin(m.group(1), m.group(2))
+    idx = m.start()
+    before = blob[max(0, idx - 220) : idx]
+    synthetic = (before + f" won by {margin}").strip()
+    out = _compact_result_from_line(
+        synthetic, oc, mitcham_team, opponent
+    )
+    if out:
+        return out
+    if oc == "win":
+        return f"Won by {margin}"
+    if oc == "loss":
+        return f"Lost by {margin}"
+    return f"Won by {margin}"
+
+
 def normalize_match_result_display(
     status: str,
     oc: str | None,
@@ -688,11 +1086,16 @@ def normalize_match_result_display(
         return "—"
 
     candidates: list[str] = []
+    full_join = "\n".join([card_text or "", *(page_result_lines or [])])
+    if full_join.strip():
+        candidates.append(re.sub(r"\s+", " ", full_join)[:4000])
     for ln in (card_text or "").splitlines():
         t = ln.strip()
         if not t:
             continue
         low = t.lower()
+        if "won by" in low or "lost by" in low:
+            candidates.append(t)
         if (
             "won by" in low
             or "tied" in low
@@ -706,7 +1109,7 @@ def normalize_match_result_display(
     scored: list[tuple[int, str]] = []
     for t in candidates:
         strict = bool(
-            re.search(r"\bwon\s+by\s+\d+\s+(runs|wickets)\b", t, flags=re.I)
+            re.search(r"\bwon\s+by\s+\d+\s+(runs?|wickets?)\b", t, flags=re.I)
         )
         scored.append((0 if strict else 1, t))
     scored.sort(key=lambda x: x[0])
@@ -731,6 +1134,15 @@ def normalize_match_result_display(
     if oc == "loss":
         return "Lost"
     if status == "Completed":
+        inferred = _infer_result_from_broad_blob(
+            card_text,
+            page_result_lines,
+            oc,
+            mitcham_team,
+            opponent,
+        )
+        if inferred:
+            return inferred
         return "Completed"
     return "—"
 
@@ -745,10 +1157,408 @@ def _raw_result_snippet_for_log(card_text: str, page_lines: list[str]) -> str:
     return ""
 
 
+_TRAILING_TEAM_PARENS_RE = re.compile(r"^(.*)\s*\(([^)]*)\)\s*$")
+
+
+def _paren_content_is_overs_or_progress(inner: str) -> bool:
+    """True for (30.2), (20), (50); False for squad markers (1)–(9)."""
+    inner = (inner or "").strip()
+    if not inner:
+        return False
+    if re.fullmatch(r"\d+\.\d+", inner):
+        return True
+    if re.fullmatch(r"\d+", inner):
+        n = int(inner)
+        if 1 <= n <= 9:
+            return False
+        return True
+    return False
+
+
+def _paren_content_is_competition_metadata(inner: str) -> bool:
+    """(80 Overs, 12 Players), (Split Innings - …), etc. — not squad (1)/(2)."""
+    low = (inner or "").lower()
+    if not low:
+        return False
+    if "overs" in low or "player" in low or "split innings" in low:
+        return True
+    if re.search(r"\b\d+\s*overs\b", low):
+        return True
+    return False
+
+
+def _strip_leading_scoreboard_prefix(s: str) -> str:
+    """Remove leading totals like '138 ', '133 & 0-0 ', '& 0-0 ', '249 & 0-0 '."""
+    t = s.strip()
+    if not t:
+        return t
+    for _ in range(12):
+        orig = t
+        m = re.match(r"^&\s*[\d.]+\s*-\s*[\d.]+\s+", t)
+        if m:
+            t = t[m.end() :].lstrip()
+            continue
+        m = re.match(r"^\d{1,4}\s*&\s*[\d.]+\s*-\s*[\d.]+\s+", t)
+        if m:
+            t = t[m.end() :].lstrip()
+            continue
+        m = re.match(r"^\d{2,4}\s+(?=[A-Za-z&])", t)
+        if m:
+            t = t[m.end() :].lstrip()
+            continue
+        if t == orig:
+            break
+    return t
+
+
+def _strip_trailing_overs_loop(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    while True:
+        m = _TRAILING_TEAM_PARENS_RE.match(s)
+        if not m:
+            break
+        body, inner = m.group(1).strip(), m.group(2)
+        if not _paren_content_is_overs_or_progress(inner):
+            break
+        s = body
+    return s
+
+
+def _strip_trailing_competition_metadata_parens(s: str) -> str:
+    """Remove trailing (80 Overs, 12 Players) etc. repeatedly."""
+    t = (s or "").strip()
+    if not t:
+        return t
+    for _ in range(8):
+        m = _TRAILING_TEAM_PARENS_RE.match(t)
+        if not m:
+            break
+        inner = (m.group(2) or "").strip()
+        if not _paren_content_is_competition_metadata(inner):
+            break
+        t = m.group(1).strip()
+    return t
+
+
+def _strip_mitcham_duplicate_grade_segment(s: str) -> str:
+    """'Mitcham U14 (2) U14 - 6 (SEDA)' -> 'Mitcham U14 (2)'."""
+    return re.sub(
+        r"\s+U\d{1,2}\s*-\s*\d+\s*\([^)]+\)\s*$",
+        "",
+        (s or "").strip(),
+        flags=re.I,
+    ).strip()
+
+
+def _strip_mitcham_numbered_shield_suffix(s: str) -> str:
+    """'… 1. Compare & Connect … Shield' -> strip from ' 1.' onwards."""
+    return re.sub(r"\s+\d+\.\s+.*$", "", (s or "").strip()).strip()
+
+
+def _strip_mitcham_space_grade_block(s: str) -> str:
+    """'… B Grade (80 Overs, 12 Players)' at end."""
+    t = re.sub(
+        r"\s+[A-Z]\s+Grade\s*\([^)]*(?:Overs|Players|Split)[^)]*\)\s*$",
+        "",
+        (s or "").strip(),
+        flags=re.I,
+    )
+    return t.strip()
+
+
+def _dedupe_mitcham_fast9_super7_lines(s: str) -> str:
+    """Remove duplicated Fast 9's / Super 7's competition tail on Mitcham lines."""
+    t = (s or "").strip()
+    m = re.match(r"(?i)^(.+?-\s*Fast\s*9'?s)\s+Fast\s*9'?s\s+.*$", t)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"(?i)^(.+?-\s*Super\s*7'?s\s+\S+)\s+Super\s*7'?s\s+.*$", t)
+    if m:
+        return m.group(1).strip()
+    return t
+
+
+def _strip_trailing_overs_and_competition_loop(s: str) -> str:
+    """Alternate overs/progress and competition-metadata parens until stable."""
+    t = (s or "").strip()
+    for _ in range(12):
+        prev = t
+        t = _strip_trailing_overs_loop(t)
+        t = _strip_trailing_competition_metadata_parens(t)
+        if t == prev:
+            break
+    return t
+
+
+def _strip_amp_score_fragments(s: str) -> str:
+    """Remove trailing/leading '& 4', '& 2-81' fragments leaked from score rows."""
+    t = re.sub(r"\s+", " ", (s or "").strip())
+    if not t or t in ("—", "-"):
+        return t
+    for _ in range(8):
+        prev = t
+        t = re.sub(r"\s*&\s*\d+(?:-\d+)?\s*$", "", t).strip()
+        t = re.sub(r"^\s*&\s*\d+(?:-\d+)?\s*", "", t).strip()
+        if t == prev:
+            break
+    return t
+
+
+def _strip_senior_mitcham_competition_suffix(s: str) -> str:
+    """
+    Strip shield / EGWC / grade tails after senior XI names only (not junior U14/U16).
+    """
+    t = re.sub(r"\s+", " ", (s or "").strip())
+    if not t:
+        return t
+    if re.search(r"(?i)\bU\s*/?\s*(10|12|14|16|18)\b", t) and not re.search(
+        r"(?i)\b(?:1st|2nd|3rd|4th|5th)\s+XI\b",
+        t,
+    ):
+        return t
+    if not re.search(r"(?i)\b(?:1st|2nd|3rd|4th|5th)\s+XI\b", t) and not re.search(
+        r"(?i)\bmitcham\s+women\b",
+        t,
+    ):
+        return t
+    t = re.sub(
+        r"(?i)\s+\d+\.\s+Compare\s*&\s*Con(?:n)?ect\s+.+?(?:Shield|shield)\s*$",
+        "",
+        t,
+    )
+    t = re.sub(
+        r"(?i)\s+\d+\.\s+.+?(?:McIntosh|mcintosh)\s+Shield\s*$",
+        "",
+        t,
+    )
+    t = re.sub(r"(?i)\s+EGWC\s+Senior\s+Women\s+.+$", "", t)
+    t = re.sub(r"(?i)\s+EGWC\s+.+$", "", t)
+    t = re.sub(
+        r"(?i)\s+\b[A-Z]\s+Grade\s*\([^)]*(?:Overs|Players|Split|Weekly)[^)]*\)\s*$",
+        "",
+        t,
+    )
+    t = re.sub(r"(?i)\s+B\s+Grade\s*\(80\s+Overs[^)]*\)\s*$", "", t)
+    t = re.sub(r"(?i)\s+D\s+Grade\s*\(64\s+Overs[^)]*\)\s*$", "", t)
+    t = re.sub(r"(?i)\s+H\s+Grade\s*\(Split\s+Innings[^)]*\)\s*$", "", t)
+    return t.strip()
+
+
+def _strip_leaked_match_result_crap_from_team_name(s: str) -> str:
+    """Remove result text, vs tails, or leaked 'won …' fragments from a team label."""
+    t = re.sub(r"\s+", " ", (s or "").strip())
+    if not t or t in ("—", "-"):
+        return t
+    t = re.sub(r"(?i)\s+won\s+by\s+.*$", "", t)
+    t = re.sub(r"(?i)\s+lost\s+by\s+.*$", "", t)
+    t = re.sub(r"(?i)\s+vs\.?\s+.*$", "", t)
+    t = re.sub(r"(?i)\s+v\.?\s+.*$", "", t)
+    t = re.sub(r"(?i)\s+—\s*(completed|abandoned|no result).*$", "", t)
+    if _mitcham_in_string(t) and re.search(r"(?i)\s+won\s+", t):
+        t = re.split(r"(?i)\s+won\s+", t, maxsplit=1)[0].strip()
+    if len(t) > 70 and re.search(r"(?i)\b(?:1st|2nd|3rd|4th|5th)\s+XI\b", t):
+        m = re.match(r"(?i)^(.+?\b(?:1st|2nd|3rd|4th|5th)\s+XI)\b", t)
+        if m and len(m.group(1)) + 10 < len(t):
+            t = m.group(1).strip()
+    return t
+
+
+def _orient_mitcham_opponent_pair(
+    hm: str, ho: str
+) -> tuple[str | None, str | None]:
+    la, lb = _mitcham_in_string(hm), _mitcham_in_string(ho)
+    if la and not lb:
+        return hm, ho
+    if lb and not la:
+        return ho, hm
+    if la and lb:
+        return hm, ho
+    return None, None
+
+
+def _scorecard_pair_quality(m: str, o: str) -> int:
+    """Higher = cleaner Mitcham vs opponent pair (for picking best header fallback)."""
+    m, o = (m or "").strip(), (o or "").strip()
+    if not m or not o or o in ("—", "-"):
+        return -10_000
+    m = _strip_amp_score_fragments(m)
+    o = _strip_amp_score_fragments(o)
+    score = 0
+    lm, lo = _mitcham_in_string(m), _mitcham_in_string(o)
+    if lm and not lo:
+        score += 500
+    elif lm and lo:
+        score += 120
+    else:
+        score += 40
+    for x in (m, o):
+        xl = x.lower()
+        if re.search(r"\s&\s*\d", x):
+            score -= 300
+        if re.search(r"(?i)\b(won|lost)\s+by\b", xl):
+            score -= 400
+        if "completed" in xl and len(xl) < 80:
+            score -= 100
+        if "|" in x:
+            score -= 50
+    score += min(len(m) + len(o), 160) // 3
+    return score
+
+
+def _best_validated_scorecard_pair_from_segments(
+    ordered: list[str],
+) -> tuple[str | None, str | None]:
+    """Scan all header segments; return the highest-quality Mitcham + opponent pair."""
+    best: tuple[str | None, str | None] = (None, None)
+    best_q = -10_000
+    seen: set[tuple[str, str]] = set()
+    for seg in ordered:
+        for candidate in (seg, _strip_scorecard_segment_for_team_parse(seg)):
+            if len(candidate) < 12:
+                continue
+            hm, ho = _parse_teams_from_scorecard_header_blob_validated(candidate)
+            if not hm or not ho:
+                continue
+            pair = _orient_mitcham_opponent_pair(hm, ho)
+            pm, po = pair[0], pair[1]
+            if not pm or not po:
+                continue
+            key = (pm, po)
+            if key in seen:
+                continue
+            seen.add(key)
+            q = _scorecard_pair_quality(pm, po)
+            if q > best_q:
+                best_q = q
+                best = (pm, po)
+    return best
+
+
+def _fallback_opponent_from_scorecard_segments(
+    ordered: list[str],
+) -> str | None:
+    """If opponent is still blank, pick first valid non-Mitcham label from segments."""
+    for seg in ordered:
+        for chunk in re.split(r"\s*\|\s*", seg):
+            chunk = _trim_team_label_side(chunk.strip())
+            chunk = _strip_leading_scoreboard_prefix(chunk)
+            chunk = _strip_amp_score_fragments(chunk)
+            if not chunk:
+                continue
+            if not _valid_scorecard_fallback_team_name(chunk):
+                continue
+            if not _mitcham_in_string(chunk):
+                return chunk[:120]
+    return None
+
+
+def _mitcham_team_is_weak(mitch: str | None) -> bool:
+    t = (mitch or "").strip()
+    if not t:
+        return True
+    tl = t.lower()
+    if tl in ("mitcham", "mitcham cc"):
+        return True
+    if re.search(r"\s&\s*\d", t):
+        return True
+    if re.search(r"(?i)\b(won|lost)\s+by\b", t):
+        return True
+    if "|" in t:
+        return True
+    if len(tl) < 14 and tl.startswith("mitcham") and "u" not in tl and "xi" not in tl:
+        return True
+    if len(t) > 100:
+        return True
+    return False
+
+
+def finalize_team_display_name(name: str, *, role: str = "opponent") -> str:
+    """
+    Final cleanup for Match Results / Facebook: scores, overs, competition junk, Mitcham-only tails.
+    role: 'mitcham' | 'opponent'
+    """
+    s = (name or "").strip()
+    if not s or s in ("—", "-"):
+        return s
+    s = _strip_amp_score_fragments(s)
+    s = _strip_leading_scoreboard_prefix(s)
+    if role == "mitcham":
+        s = _strip_mitcham_duplicate_grade_segment(s)
+        s = _strip_mitcham_numbered_shield_suffix(s)
+        s = _strip_mitcham_space_grade_block(s)
+        s = _dedupe_mitcham_fast9_super7_lines(s)
+    s = _strip_trailing_overs_and_competition_loop(s)
+    if role == "mitcham":
+        s = _strip_mitcham_numbered_shield_suffix(s)
+        s = _strip_mitcham_space_grade_block(s)
+        s = _dedupe_mitcham_fast9_super7_lines(s)
+        s = _strip_trailing_overs_and_competition_loop(s)
+        s = _strip_senior_mitcham_competition_suffix(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = _strip_amp_score_fragments(s)
+    return s
+
+
+def clean_team_name_for_display(name: str) -> str:
+    """Backward-compatible alias: opponent-style cleanup."""
+    return finalize_team_display_name(name, role="opponent")
+
+
+def _context_indicates_womens_senior_competition(
+    team_category: str,
+    discovered_label: str,
+    match_url: str,
+    card: str,
+    blob: str,
+) -> bool:
+    """True when the fixture is a women's senior comp (EGWC etc.), not junior girls."""
+    if team_category == "senior_women":
+        return True
+    u = (match_url or "").lower().replace("_", "-")
+    if "egwc" in u or "senior-women" in u or "seniorwomen" in u:
+        return True
+    hay = f"{discovered_label} {card} {blob}".lower()
+    if "egwc" in hay and "women" in hay:
+        return True
+    if re.search(r"senior\s+women", hay):
+        return True
+    if re.search(r"(?i)women'?s?\s+[abc]\s+grade", hay):
+        return True
+    return False
+
+
+def format_mitcham_team_for_match_display(
+    cleaned_mitcham: str,
+    *,
+    team_category: str,
+    discovered_label: str,
+    match_url: str,
+    card: str,
+    blob: str,
+) -> str:
+    """
+    Final Mitcham column: prefix women's senior sides as 'Mitcham Women - …' when needed.
+    """
+    base = (cleaned_mitcham or "").strip()
+    if not base:
+        base = "Mitcham"
+    if not _context_indicates_womens_senior_competition(
+        team_category, discovered_label, match_url, card, blob
+    ):
+        return base
+    if re.match(r"(?i)^mitcham\s+women(\s+[-–]\s+|\s+)", base):
+        return base
+    if re.search(r"(?i)\bmitcham\s+women\b", base):
+        return base
+    return f"Mitcham Women - {base}"
+
+
 def _resolve_match_row_fields(
     item: dict[str, Any],
     rep: Any,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Combine fixture card, grade list context, and scorecard page metadata."""
     card = item["card"]
     status = item["status"]
@@ -778,81 +1588,209 @@ def _resolve_match_row_fields(
     disc = (item.get("discovered_team_label") or "").strip()
     mp = (getattr(rep, "mitcham_team_from_page", None) or "").strip()
     ms = (item.get("mitcham_side") or "").strip()
-    disc_mitcham_ok = bool(disc and _mitcham_in_string(disc))
 
+    fh_home = (getattr(rep, "fixture_header_home_team", None) or "").strip()
+    fh_away = (getattr(rep, "fixture_header_away_team", None) or "").strip()
+    fh_result = (getattr(rep, "fixture_header_result_text", None) or "").strip()
+    fixture_teams_primary = False
     mitch: str | None = None
-    if disc and _mitcham_in_string(disc):
-        mitch = disc
-    elif mp and _mitcham_in_string(mp):
-        mitch = mp
-    else:
-        rest = [
-            x.strip()
-            for x in (card_m, pair_m, ms)
-            if x and _mitcham_in_string(str(x))
-        ]
-        mitch = max(rest, key=len) if rest else None
-
-    if not mitch or len(mitch) <= len("Mitcham") + 1:
-        lengthen_sources = (
-            (card_m, mp, disc, ms)
-            if disc_mitcham_ok
-            else (pair_m, card_m, mp, disc, ms)
-        )
-        for x in lengthen_sources:
-            if (
-                x
-                and _mitcham_in_string(str(x))
-                and len(str(x).strip()) > len(mitch or "")
-            ):
-                mitch = str(x).strip()
-
-    if not mitch:
-        mitch = "Mitcham"
-
     opp: str | None = None
-    if pair_o and not _mitcham_in_string(pair_o):
-        opp = pair_o.strip()
-    rp = getattr(rep, "opponent_from_scorecard", None)
-    if (not opp or opp in ("—", "-")) and rp:
-        rs = str(rp).strip()
-        if rs and not _mitcham_in_string(rs):
-            opp = rs
-    if not opp or opp in ("—", "-"):
-        for c in (card_o, item.get("opponent")):
-            if (
-                c
-                and str(c).strip() not in ("—", "-", "")
-                and not _mitcham_in_string(str(c))
-            ):
-                opp = str(c).strip()
-                break
-    if not opp or opp in ("—", "-"):
-        for seg in re.split(r"\s*\|\s*", blob):
-            o = _opponent_from_match_title_blob(seg.strip())
-            if o:
-                opp = o
-                break
+    if fh_home and fh_away:
+        h, a = fh_home, fh_away
+        hm_f, ha_f = _mitcham_in_string(h), _mitcham_in_string(a)
+        if hm_f and not ha_f:
+            mitch, opp, fixture_teams_primary = h, a, True
+        elif ha_f and not hm_f:
+            mitch, opp, fixture_teams_primary = a, h, True
 
-    if not opp or opp in ("—", "-"):
-        opp = "—"
+    if not fixture_teams_primary:
+        disc_mitcham_ok = bool(disc and _mitcham_in_string(disc))
+
+        if disc and _mitcham_in_string(disc):
+            mitch = disc
+        elif mp and _mitcham_in_string(mp):
+            mitch = mp
+        else:
+            rest = [
+                x.strip()
+                for x in (card_m, pair_m, ms)
+                if x and _mitcham_in_string(str(x))
+            ]
+            mitch = max(rest, key=len) if rest else None
+
+        if not mitch or len(mitch) <= len("Mitcham") + 1:
+            lengthen_sources = (
+                (card_m, mp, disc, ms)
+                if disc_mitcham_ok
+                else (pair_m, card_m, mp, disc, ms)
+            )
+            for x in lengthen_sources:
+                if (
+                    x
+                    and _mitcham_in_string(str(x))
+                    and len(str(x).strip()) > len(mitch or "")
+                ):
+                    mitch = str(x).strip()
+
+        if not mitch:
+            mitch = "Mitcham"
+
+        if pair_o and not _mitcham_in_string(pair_o):
+            opp = pair_o.strip()
+        rp = getattr(rep, "opponent_from_scorecard", None)
+        if (not opp or opp in ("—", "-")) and rp:
+            rs = str(rp).strip()
+            if rs and not _mitcham_in_string(rs):
+                opp = rs
+        if not opp or opp in ("—", "-"):
+            for c in (card_o, item.get("opponent")):
+                if (
+                    c
+                    and str(c).strip() not in ("—", "-", "")
+                    and not _mitcham_in_string(str(c))
+                ):
+                    opp = str(c).strip()
+                    break
+        if not opp or opp in ("—", "-"):
+            for seg in re.split(r"\s*\|\s*", blob):
+                o = _opponent_from_match_title_blob(seg.strip())
+                if o:
+                    opp = o
+                    break
+
+        if not opp or opp in ("—", "-"):
+            opp = "—"
+        else:
+            opp = str(opp).strip()
     else:
+        mitch = str(mitch).strip()
         opp = str(opp).strip()
 
-    page_lines = list(getattr(rep, "scorecard_result_lines", None) or [])
-    result = normalize_match_result_display(
-        status,
-        oc,
-        card,
-        page_lines,
-        mitch if mitch != "—" else None,
-        opp if opp != "—" else None,
+    mitch = _strip_amp_score_fragments(mitch)
+    if opp not in ("—", "-"):
+        opp = _strip_amp_score_fragments(opp)
+
+    cur_o = opp if opp not in ("—", "-") else ""
+    cur_q = _scorecard_pair_quality(mitch, cur_o) if cur_o else -5000
+    if scorecard_ordered and not fixture_teams_primary:
+        bm, bo = _best_validated_scorecard_pair_from_segments(scorecard_ordered)
+        if bm and bo and _scorecard_pair_quality(bm, bo) > cur_q:
+            mitch, opp = bm, bo
+    if (not opp or opp in ("—", "-")) and not fixture_teams_primary:
+        fo = _fallback_opponent_from_scorecard_segments(scorecard_ordered)
+        if fo:
+            opp = fo
+
+    mitch = _strip_leaked_match_result_crap_from_team_name(mitch)
+    if opp not in ("—", "-"):
+        opp = _strip_leaked_match_result_crap_from_team_name(opp)
+
+    resolved_mitcham_team = mitch
+    resolved_opponent = opp
+    cleaned_mitcham_team = finalize_team_display_name(mitch, role="mitcham")
+    cleaned_opponent = (
+        finalize_team_display_name(opp, role="opponent")
+        if opp not in ("—", "-")
+        else "—"
     )
+
+    weak_mitcham_detected = _mitcham_team_is_weak(
+        cleaned_mitcham_team
+    ) or cleaned_opponent in ("—", "-")
+    if weak_mitcham_detected and scorecard_ordered and not fixture_teams_primary:
+        bm2, bo2 = _best_validated_scorecard_pair_from_segments(scorecard_ordered)
+        if bm2 and bo2:
+            q_new = _scorecard_pair_quality(bm2, bo2)
+            q_old = _scorecard_pair_quality(
+                cleaned_mitcham_team,
+                cleaned_opponent if cleaned_opponent not in ("—", "-") else "",
+            )
+            if q_new > q_old:
+                mitch = _strip_amp_score_fragments(
+                    _strip_leaked_match_result_crap_from_team_name(bm2)
+                )
+                opp = _strip_amp_score_fragments(
+                    _strip_leaked_match_result_crap_from_team_name(bo2)
+                )
+                resolved_mitcham_team = mitch
+                resolved_opponent = opp
+                cleaned_mitcham_team = finalize_team_display_name(mitch, role="mitcham")
+                cleaned_opponent = (
+                    finalize_team_display_name(opp, role="opponent")
+                    if opp not in ("—", "-")
+                    else "—"
+                )
+                weak_mitcham_detected = _mitcham_team_is_weak(
+                    cleaned_mitcham_team
+                ) or cleaned_opponent in ("—", "-")
+
+    if disc:
+        team_cat: TeamCategory = classify_team_label(disc)
+    else:
+        tc_raw = item.get("team_category")
+        if tc_raw in ("junior", "senior_men", "senior_women"):
+            team_cat = tc_raw  # type: ignore[assignment]
+        elif tc_raw == "senior":
+            team_cat = "senior_men"
+        else:
+            team_cat = "junior"
+
+    junior_fast9_super7 = is_junior_fast9_or_super7_label(disc)
+
+    final_mitcham_team = format_mitcham_team_for_match_display(
+        cleaned_mitcham_team,
+        team_category=team_cat,
+        discovered_label=disc,
+        match_url=str(item.get("match_url") or ""),
+        card=card,
+        blob=blob,
+    )
+    final_mitcham_team = finalize_team_display_name(final_mitcham_team, role="mitcham")
+    final_opponent_team = cleaned_opponent
+
+    page_lines = list(getattr(rep, "scorecard_result_lines", None) or [])
+    result_from_fixture = None
+    if fh_result and status == "Completed":
+        result_from_fixture = normalize_fixture_header_result_to_compact(
+            fh_result,
+            final_mitcham_team,
+            final_opponent_team if final_opponent_team not in ("—", "-") else None,
+            oc,
+        )
+    if result_from_fixture:
+        result = result_from_fixture
+    else:
+        result = normalize_match_result_display(
+            status,
+            oc,
+            card,
+            page_lines,
+            mitch if mitch != "—" else None,
+            opp if opp != "—" else None,
+        )
+        if result == "Completed" and status == "Completed":
+            inferred2 = _infer_result_from_broad_blob(
+                card,
+                page_lines,
+                oc,
+                final_mitcham_team,
+                final_opponent_team if final_opponent_team not in ("—", "-") else None,
+            )
+            if inferred2 and inferred2 != "Completed":
+                result = inferred2
     raw_log = _raw_result_snippet_for_log(card, page_lines)
     parsed_pair = f"({vs_m!r}, {vs_o!r})"
     return {
-        "mitcham_team": mitch,
-        "opponent": opp,
+        "mitcham_team": final_mitcham_team,
+        "opponent": final_opponent_team,
+        "team_category": team_cat,
+        "resolved_mitcham_team": resolved_mitcham_team,
+        "resolved_opponent": resolved_opponent,
+        "cleaned_mitcham_team": cleaned_mitcham_team,
+        "cleaned_opponent": cleaned_opponent,
+        "final_mitcham_team": final_mitcham_team,
+        "final_opponent": final_opponent_team,
+        "junior_fast9_super7": junior_fast9_super7,
         "result": result,
         "raw_teams_log": (
             f"card=({card_m!r},{card_o!r}); "
@@ -870,12 +1808,106 @@ def _resolve_match_row_fields(
         "scorecard_candidate_segments": scorecard_candidates,
         "scorecard_chosen_header_segment": chosen_header_segment,
         "scorecard_header_parsed_pair": header_parsed_pair_log,
+        "weak_mitcham_detected": weak_mitcham_detected,
+        "fixture_header_home_team": fh_home,
+        "fixture_header_away_team": fh_away,
+        "fixture_header_result_text": fh_result,
     }
+
+
+def _facebook_mitcham_field_usable(mt: str) -> bool:
+    t = (mt or "").strip()
+    if not t:
+        return False
+    if len(t) > 200:
+        return False
+    low = t.lower()
+    if "won by" in low or "lost by" in low:
+        return False
+    if " vs " in t and len(t) > 120:
+        return False
+    return True
+
+
+def _facebook_opponent_field_usable(opp: str) -> bool:
+    o = (opp or "").strip()
+    if not o or o in ("—", "-"):
+        return False
+    if o.lower() == "opposition":
+        return False
+    return True
+
+
+def _facebook_mitcham_won_result(result: str) -> bool | None:
+    low = (result or "").lower().strip()
+    if low.startswith("won by") or low == "won":
+        return True
+    if low.startswith("lost by") or low == "lost":
+        return False
+    return None
+
+
+def _facebook_row_summary_line(
+    row: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Build one Facebook line from mitcham_team, opponent, result, status only."""
+    mt = str(row.get("mitcham_team") or "").strip()
+    opp = str(row.get("opponent") or "").strip()
+    res = str(row.get("result") or "").strip()
+    status = str(row.get("status") or "").strip()
+
+    if not _facebook_mitcham_field_usable(mt):
+        return None, "mitcham_unusable"
+
+    ou = _facebook_opponent_field_usable(opp)
+    won = _facebook_mitcham_won_result(res)
+    res_l = res.lower()
+
+    def res_is_vague() -> bool:
+        return not res or res in ("—", "-") or res_l == "completed"
+
+    if won is True:
+        if ou:
+            return f"{mt} d. {opp}", None
+        if not res_is_vague():
+            return f"{mt} — {res}", None
+        return None, "win_no_opponent"
+
+    if won is False:
+        if ou:
+            return f"{opp} d. {mt}", None
+        if not res_is_vague():
+            return f"{mt} — {res}", None
+        return None, "loss_no_opponent"
+
+    if "tie" in res_l or (
+        status == "Completed" and ("draw" in res_l or "tie" in res_l)
+    ):
+        if not ou:
+            return None, "tie_no_opponent"
+        return f"{mt} vs {opp} — {res or 'Draw'}", None
+
+    if status == "In progress":
+        if ou:
+            return f"{mt} vs {opp} — In progress", None
+        return f"{mt} — In progress", None
+
+    if not res_is_vague():
+        if ou:
+            return f"{mt} vs {opp} — {res}", None
+        return f"{mt} — {res}", None
+
+    if status == "Completed":
+        if ou:
+            return f"{mt} vs {opp}", None
+        return None, "completed_bare"
+
+    return None, "insufficient_fields"
 
 
 def _log_match_results_row(
     url: str,
-    resolved: dict[str, str],
+    resolved: dict[str, Any],
     status: str,
 ) -> None:
     opp = resolved.get("opponent") or "—"
@@ -884,8 +1916,12 @@ def _log_match_results_row(
     else:
         pair_note = ""
     cands = resolved.get("scorecard_candidate_segments") or []
+    fb_line, fb_skip = _facebook_row_summary_line(resolved)
     msg = (
         f"[MatchResultsRow] url={url} "
+        f"fixture_header_home_team={resolved.get('fixture_header_home_team')!r} "
+        f"fixture_header_away_team={resolved.get('fixture_header_away_team')!r} "
+        f"fixture_header_result_text={resolved.get('fixture_header_result_text')!r} "
         f"discovered_team_label={resolved.get('discovered_team_label')!r} "
         f"mitcham_team_from_page={resolved.get('mitcham_team_from_page')!r} "
         f"raw_match_team_blob={resolved.get('raw_match_team_blob')!r} "
@@ -894,13 +1930,42 @@ def _log_match_results_row(
         f"scorecard_chosen_header_segment={resolved.get('scorecard_chosen_header_segment')!r} "
         f"scorecard_header_parsed_pair={resolved.get('scorecard_header_parsed_pair')!r} "
         f"scorecard_header_fallback={resolved.get('scorecard_header_pair')!r} "
-        f"resolved_mitcham_team={resolved.get('mitcham_team')!r} "
-        f"resolved_opponent={resolved.get('opponent')!r} "
+        f"team_category={resolved.get('team_category')!r} "
+        f"junior_fast9_super7={resolved.get('junior_fast9_super7')!r} "
+        f"weak_mitcham_detected={resolved.get('weak_mitcham_detected')!r} "
+        f"resolved_mitcham_team={resolved.get('resolved_mitcham_team')!r} "
+        f"resolved_opponent={resolved.get('resolved_opponent')!r} "
+        f"cleaned_mitcham_team={resolved.get('cleaned_mitcham_team')!r} "
+        f"cleaned_opponent={resolved.get('cleaned_opponent')!r} "
+        f"final_mitcham_team={resolved.get('final_mitcham_team')!r} "
+        f"final_opponent_team={resolved.get('final_opponent')!r} "
         f"raw_result={resolved.get('raw_result_log')!r} "
         f"normalized_result={resolved.get('result')!r} status={status!r}"
-        f"{pair_note}"
+        f"{pair_note} "
+        f"facebook_line={fb_line!r} facebook_skip_reason={fb_skip!r}"
     )
     logger.info(msg)
+    try:
+        tlog = Path(__file__).resolve().parent / "match_results_team_names.log"
+        with tlog.open("a", encoding="utf-8") as fh:
+            fh.write(
+                f"url={url} "
+                f"fixture_header_home_team={resolved.get('fixture_header_home_team')!r} "
+                f"fixture_header_away_team={resolved.get('fixture_header_away_team')!r} "
+                f"fixture_header_result_text={resolved.get('fixture_header_result_text')!r} "
+                f"discovered_team_label={resolved.get('discovered_team_label')!r} "
+                f"team_category={resolved.get('team_category')!r} "
+                f"junior_fast9_super7={resolved.get('junior_fast9_super7')!r} "
+                f"weak_mitcham_detected={resolved.get('weak_mitcham_detected')!r} "
+                f"resolved_mitcham_team={resolved.get('resolved_mitcham_team')!r} "
+                f"resolved_opponent={resolved.get('resolved_opponent')!r} "
+                f"cleaned_mitcham_team={resolved.get('cleaned_mitcham_team')!r} "
+                f"cleaned_opponent={resolved.get('cleaned_opponent')!r} "
+                f"final_mitcham_team={resolved.get('final_mitcham_team')!r} "
+                f"final_opponent={resolved.get('final_opponent')!r}\n"
+            )
+    except OSError:
+        pass
     if _env_truthy("MITCHAM_MATCH_RESULTS_DEBUG"):
         try:
             logf = Path(__file__).resolve().parent / "match_results_metadata.log"
@@ -929,6 +1994,8 @@ def build_summary_sentence(
     draws: int,
     in_progress: int,
     completed: int,
+    *,
+    scope: str = "junior",
 ) -> str:
     finished = wins + losses + draws
     if finished > 0:
@@ -941,8 +2008,14 @@ def build_summary_sentence(
             tone = "a challenging"
     else:
         tone = "an"
+    if scope == "senior":
+        who = "Mitcham senior sides had"
+    elif scope == "both":
+        who = "Mitcham teams (juniors and seniors) had"
+    else:
+        who = "Mitcham juniors had"
     return (
-        f"Mitcham had {tone} outing in the selected period with results showing "
+        f"{who} {tone} outing in the selected period with results showing "
         f"{wins} wins, {losses} losses, {draws} draws/ties and {in_progress} games in progress."
     )
 
@@ -2255,6 +3328,9 @@ class ScorecardExtractReport:
     opposition_innings_for_bowling: list[str] = field(default_factory=list)
     opponent_from_scorecard: str | None = None
     mitcham_team_from_page: str | None = None
+    fixture_header_home_team: str = ""
+    fixture_header_away_team: str = ""
+    fixture_header_result_text: str = ""
     raw_match_team_blob: str = ""
     scorecard_result_lines: list[str] = field(default_factory=list)
     batting_tables_parsed: int = 0
@@ -2324,6 +3400,14 @@ def scrape_match_scorecard(
     if not ready:
         rep.note = (rep.note + " scorecard_content_wait_timeout;").strip()
     page.wait_for_timeout(260)
+
+    try:
+        fh_meta = _extract_fixture_header_metadata(page)
+        rep.fixture_header_home_team = fh_meta.get("homeTeam") or ""
+        rep.fixture_header_away_team = fh_meta.get("awayTeam") or ""
+        rep.fixture_header_result_text = fh_meta.get("resultText") or ""
+    except Exception:
+        pass
 
     try:
         probe = _scorecard_dom_probe(page)
@@ -2660,6 +3744,11 @@ def list_matches_for_team(page: Page, team: TeamRef) -> list[tuple[str, str]]:
     """Return (match_url, card_inner_text) for completed and in-progress listings."""
     page.goto(team.grade_url, wait_until="domcontentloaded", timeout=120_000)
     page.wait_for_timeout(650)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=30_000)
+    except Exception:
+        pass
+    page.wait_for_timeout(450)
     # Snapshot links in one evaluate — avoids count()+nth(i) timeouts when the DOM
     # updates or count() overshoots visible / stable nodes.
     raw_rows: list[dict[str, str]] = page.evaluate(
@@ -2737,6 +3826,17 @@ def _log_bowling_match_extraction(
             pass
 
 
+def _log_fetch_scope(payload: dict[str, Any]) -> None:
+    msg = " | ".join(f"{k}={v!r}" for k, v in payload.items())
+    logger.info("[FetchScope] %s", msg)
+    try:
+        logf = Path(__file__).resolve().parent / "mitcham_fetch_scope.log"
+        with logf.open("a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+    except OSError:
+        pass
+
+
 def run_report(
     season_label: str,
     date_from: date,
@@ -2744,11 +3844,32 @@ def run_report(
     min_runs: int = 20,
     min_wickets: int = 1,
     headless: bool = True,
+    *,
+    include_juniors: bool = True,
+    include_seniors: bool = False,
     teams_cache: dict[str, list[TeamRef]] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    if not include_juniors and not include_seniors:
+        raise ValueError("Select at least one of juniors or seniors.")
+
     d_from = min(date_from, date_to)
     d_to = max(date_from, date_to)
+    fetch_scope_key = (
+        f"{season_label}|{d_from.isoformat()}|{d_to.isoformat()}"
+        f"|{int(include_juniors)}|{int(include_seniors)}"
+    )
+    logger.info(
+        "[FetchScopeReset] season=%r date_from=%r date_to=%r juniors_checked=%s "
+        "seniors_checked=%s fetch_scope_key=%r accumulators=batting_highlights,"
+        "bowling_highlights,match_rows,all_bowling_agg (fresh per run)",
+        season_label,
+        d_from.isoformat(),
+        d_to.isoformat(),
+        include_juniors,
+        include_seniors,
+        fetch_scope_key,
+    )
     batting_highlights: list[dict[str, Any]] = []
     bowling_highlights: list[dict[str, Any]] = []
     match_rows: list[dict[str, Any]] = []
@@ -2765,50 +3886,117 @@ def run_report(
             progress_callback(msg)
 
     cache = teams_cache if teams_cache is not None else {}
+    cache_key = season_label
     t_total = time.perf_counter()
+    selected_teams: list[TeamRef] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         page = browser.new_page()
         try:
             t0 = time.perf_counter()
-            if season_label in cache:
-                juniors = cache[season_label]
-                prog("Using cached junior teams for this season…")
-                logger.info("Team list: cache hit for %s (%d teams)", season_label, len(juniors))
+            if cache_key in cache:
+                all_teams = cache[cache_key]
+                prog("Using cached club teams for this season…")
+                logger.info(
+                    "Team list: cache hit key=%r (%d teams)",
+                    cache_key,
+                    len(all_teams),
+                )
             else:
-                prog("Selecting season and loading junior teams…")
+                prog("Selecting season and loading club teams…")
                 _select_season(page, season_label)
-                teams = discover_teams_from_page(page)
-                juniors = [t for t in teams if is_junior_team_label(t.label)]
-                cache[season_label] = juniors
-                logger.info("Team list: cached %d junior teams for %s", len(juniors), season_label)
+                all_teams = discover_teams_from_page(page)
+                cache[cache_key] = all_teams
+                logger.info(
+                    "Team list: cached %d teams for season key=%r",
+                    len(all_teams),
+                    cache_key,
+                )
             _perf("team discovery", t0)
 
+            n_jr_all = sum(1 for t in all_teams if classify_team_label(t.label) == "junior")
+            n_srm_all = sum(
+                1 for t in all_teams if classify_team_label(t.label) == "senior_men"
+            )
+            n_srw_all = sum(
+                1 for t in all_teams if classify_team_label(t.label) == "senior_women"
+            )
+
+            selected_teams = teams_for_scope(
+                all_teams,
+                include_juniors=include_juniors,
+                include_seniors=include_seniors,
+            )
+            n_jr_sel = sum(1 for t in selected_teams if classify_team_label(t.label) == "junior")
+            n_srm_sel = sum(
+                1 for t in selected_teams if classify_team_label(t.label) == "senior_men"
+            )
+            n_srw_sel = sum(
+                1 for t in selected_teams if classify_team_label(t.label) == "senior_women"
+            )
+
+            _log_fetch_scope(
+                {
+                    "season": season_label,
+                    "cache_key": cache_key,
+                    "juniors_checked": include_juniors,
+                    "seniors_checked": include_seniors,
+                    "junior_teams_found": n_jr_all,
+                    "senior_men_teams_found": n_srm_all,
+                    "senior_women_teams_found": n_srw_all,
+                    "junior_teams_selected": n_jr_sel,
+                    "senior_men_teams_selected": n_srm_sel,
+                    "senior_women_teams_selected": n_srw_sel,
+                    "all_teams_cached": len(all_teams),
+                }
+            )
+
             by_url: dict[str, dict[str, Any]] = {}
+            per_team_raw_matches: dict[str, int] = {}
             t1 = time.perf_counter()
-            prog(f"Scanning fixtures ({len(juniors)} junior sides)…")
-            for team in juniors:
-                pairs = list_matches_for_team(page, team)
-                for match_url, card in pairs:
-                    md = _parse_first_match_date(card)
-                    if md is None or md < d_from or md > d_to:
-                        continue
-                    if match_url in by_url:
-                        continue
-                    status = match_status_from_card(card)
-                    oc = outcome_from_card(card)
-                    mitcham_side, opponent = parse_match_card_teams(card)
-                    by_url[match_url] = {
-                        "match_url": match_url,
-                        "card": card,
-                        "md": md,
-                        "status": status,
-                        "oc": oc,
-                        "mitcham_side": mitcham_side,
-                        "opponent": opponent,
-                        "discovered_team_label": team.label,
-                    }
+            prog(f"Scanning fixtures ({len(selected_teams)} teams)…")
+            for attempt in range(3):
+                for team in selected_teams:
+                    tc = classify_team_label(team.label)
+                    pairs = list_matches_for_team(page, team)
+                    if attempt == 0:
+                        per_team_raw_matches[team.label] = len(pairs)
+                        logger.info(
+                            "[TeamFixtureDiscovery] current_team_label=%r "
+                            "current_team_category=%r raw_matches_found=%d",
+                            team.label,
+                            tc,
+                            len(pairs),
+                        )
+                    for match_url, card in pairs:
+                        md = _parse_first_match_date(card)
+                        if md is None or md < d_from or md > d_to:
+                            continue
+                        if match_url in by_url:
+                            continue
+                        status = match_status_from_card(card)
+                        oc = outcome_from_card(card)
+                        mitcham_side, opponent = parse_match_card_teams(card)
+                        by_url[match_url] = {
+                            "match_url": match_url,
+                            "card": card,
+                            "md": md,
+                            "status": status,
+                            "oc": oc,
+                            "mitcham_side": mitcham_side,
+                            "opponent": opponent,
+                            "discovered_team_label": team.label,
+                            "team_category": tc,
+                        }
+                logger.info(
+                    "match_count_attempt_%d=%d",
+                    attempt + 1,
+                    len(by_url),
+                )
+                if attempt < 2:
+                    page.wait_for_timeout(650)
+            logger.info("final_match_count=%d", len(by_url))
             _perf("match discovery (date-filtered)", t1)
 
             ordered = sorted(
@@ -2816,13 +4004,54 @@ def run_report(
                 key=lambda x: (x["md"] or date.min, x["match_url"]),
             )
             n_m = len(ordered)
+            n_matches_junior = sum(
+                1 for x in ordered if x.get("team_category") == "junior"
+            )
+            n_matches_senior_men = sum(
+                1 for x in ordered if x.get("team_category") == "senior_men"
+            )
+            n_matches_senior_women = sum(
+                1 for x in ordered if x.get("team_category") == "senior_women"
+            )
+            _log_fetch_scope(
+                {
+                    "season": season_label,
+                    "cache_key": cache_key,
+                    "total_matches_fetched": n_m,
+                    "final_match_count": n_m,
+                    "match_discovery_attempts": 3,
+                    "matches_junior": n_matches_junior,
+                    "matches_senior_men": n_matches_senior_men,
+                    "matches_senior_women": n_matches_senior_women,
+                }
+            )
             prog(f"Loading {n_m} scorecards…")
             t2 = time.perf_counter()
+            team_accepted: dict[str, int] = defaultdict(int)
+            team_rejected: dict[str, int] = defaultdict(int)
             for i, item in enumerate(ordered):
                 match_url = item["match_url"]
                 md: date = item["md"]
                 status = item["status"]
                 oc = item["oc"]
+                disc_lab = item.get("discovered_team_label") or ""
+
+                bats, bowls, _rep = scrape_match_scorecard(page, match_url, md)
+                resolved = _resolve_match_row_fields(item, _rep)
+                ok, rej = is_valid_mitcham_match(
+                    _rep, resolved, item.get("card") or ""
+                )
+                _log_match_validation(
+                    match_url, disc_lab, _rep, resolved, ok, rej
+                )
+                if not ok:
+                    team_rejected[disc_lab] += 1
+                    if n_m and (i + 1) % max(1, n_m // 8) == 0:
+                        prog(f"Scorecards {i + 1}/{n_m}…")
+                    continue
+
+                team_accepted[disc_lab] += 1
+
                 if status == "Completed":
                     if oc == "win":
                         wins += 1
@@ -2833,7 +4062,6 @@ def run_report(
                 elif status == "In progress":
                     in_progress += 1
 
-                bats, bowls, _rep = scrape_match_scorecard(page, match_url, md)
                 if status == "Completed":
                     _log_scorecard_report(_rep)
                     logger.info(
@@ -2865,7 +4093,6 @@ def run_report(
                         (name, wkts, runs_con, ds, match_url)
                     )
 
-                resolved = _resolve_match_row_fields(item, _rep)
                 match_rows.append(
                     {
                         "date": ds,
@@ -2879,6 +4106,18 @@ def run_report(
                 _log_match_results_row(match_url, resolved, status)
                 if n_m and (i + 1) % max(1, n_m // 8) == 0:
                     prog(f"Scorecards {i + 1}/{n_m}…")
+
+            for team in selected_teams:
+                lab = team.label
+                logger.info(
+                    "[TeamFixtureDiscovery] summary current_team_label=%r "
+                    "raw_matches_found=%d accepted_matches=%d "
+                    "rejected_non_mitcham_matches=%d",
+                    lab,
+                    per_team_raw_matches.get(lab, 0),
+                    team_accepted.get(lab, 0),
+                    team_rejected.get(lab, 0),
+                )
             agg_bowl_pass_min = sum(1 for t in all_bowling_agg if t[1] >= min_wickets)
             _perf("scorecard parsing (total)", t2)
             logger.info(
@@ -2951,11 +4190,34 @@ def run_report(
     match_rows.sort(key=lambda r: (r["date"] or "", r["mitcham_team"]))
 
     completed_finished = wins + losses + draws
+    if include_juniors and include_seniors:
+        scope = "both"
+    elif include_seniors:
+        scope = "senior"
+    else:
+        scope = "junior"
     summary_sentence = build_summary_sentence(
-        wins, losses, draws, in_progress, completed_finished
+        wins,
+        losses,
+        draws,
+        in_progress,
+        completed_finished,
+        scope=scope,
     )
 
+    junior_only_selected = [
+        t for t in selected_teams if classify_team_label(t.label) == "junior"
+    ]
+    senior_men_selected = [
+        t for t in selected_teams if classify_team_label(t.label) == "senior_men"
+    ]
+    senior_women_selected = [
+        t for t in selected_teams if classify_team_label(t.label) == "senior_women"
+    ]
+    senior_only_selected = senior_men_selected + senior_women_selected
+
     return {
+        "fetch_scope_key": fetch_scope_key,
         "season": season_label,
         "club_url_requested": CLUB_URL_AS_GIVEN,
         "club_page": CLUB_PAGE,
@@ -2963,7 +4225,24 @@ def run_report(
         "date_to": d_to.isoformat(),
         "min_runs": min_runs,
         "min_wickets": min_wickets,
-        "junior_teams": [{"label": t.label, "url": t.grade_url} for t in juniors],
+        "include_juniors": include_juniors,
+        "include_seniors": include_seniors,
+        "scope": scope,
+        "junior_teams": [
+            {"label": t.label, "url": t.grade_url} for t in junior_only_selected
+        ],
+        "senior_teams": [
+            {"label": t.label, "url": t.grade_url} for t in senior_only_selected
+        ],
+        "senior_men_teams": [
+            {"label": t.label, "url": t.grade_url} for t in senior_men_selected
+        ],
+        "senior_women_teams": [
+            {"label": t.label, "url": t.grade_url} for t in senior_women_selected
+        ],
+        "selected_teams": [
+            {"label": t.label, "url": t.grade_url} for t in selected_teams
+        ],
         "wins": wins,
         "losses": losses,
         "draws": draws,
@@ -3034,35 +4313,10 @@ def _facebook_short_opponent(opponent: str) -> str:
     return o[:56].rstrip(" -–|") if o else "Opposition"
 
 
-def _facebook_mitcham_won_result(result: str) -> bool | None:
-    low = (result or "").lower().strip()
-    if low.startswith("won by") or low == "won":
-        return True
-    if low.startswith("lost by") or low == "lost":
-        return False
-    return None
-
-
-def _facebook_match_result_line(row: dict[str, Any]) -> str:
-    """One social-ready line; scores omitted (not present on match_rows without scraper changes)."""
-    grade = _facebook_compact_grade_label(str(row.get("mitcham_team") or ""))
-    opp = _facebook_short_opponent(str(row.get("opponent") or ""))
-    res = str(row.get("result") or "").strip()
-    status = str(row.get("status") or "").strip()
-    won = _facebook_mitcham_won_result(res)
-
-    if won is True:
-        return f"{grade} - Mitcham d. {opp}"
-    if won is False:
-        return f"{grade} - {opp} d. Mitcham"
-    low = res.lower()
-    if "tie" in low or status == "Completed" and ("draw" in low or "tie" in low):
-        return f"{grade} - Mitcham vs {opp} — {res or 'Draw'}"
-    if status == "In progress":
-        return f"{grade} - Mitcham vs {opp} — In progress"
-    if res and res != "—":
-        return f"{grade} - Mitcham vs {opp} — {res}"
-    return f"{grade} - Mitcham vs {opp}"
+def _facebook_match_result_line(row: dict[str, Any]) -> str | None:
+    """Facebook line from resolved row fields only; None if skipped."""
+    line, _ = _facebook_row_summary_line(row)
+    return line
 
 
 def _facebook_batting_lines(bh: list[dict[str, Any]], limit: int = 30) -> list[str]:
@@ -3101,9 +4355,19 @@ def _facebook_bowling_combined_lines(bo: list[dict[str, Any]], limit: int = 30) 
     return [x[3] for x in ranked[:limit]]
 
 
+def _facebook_wrap_title(data: dict[str, Any]) -> str:
+    j = data.get("include_juniors", True)
+    s = data.get("include_seniors", False)
+    if j and s:
+        return "Mitcham Cricket Club — Junior & senior stats"
+    if s and not j:
+        return "Mitcham Cricket Club — Senior stats"
+    return "Mitcham Cricket Club — Junior stats"
+
+
 def facebook_summary(data: dict[str, Any]) -> str:
     lines: list[str] = []
-    lines.append("Mitcham Cricket Club — Junior wrap")
+    lines.append(_facebook_wrap_title(data))
     lines.append("")
     intro = (data.get("summary_sentence") or "").strip()
     if intro:
@@ -3114,8 +4378,20 @@ def facebook_summary(data: dict[str, Any]) -> str:
 
     match_rows = list(data.get("match_rows") or [])
     if match_rows:
+        any_fb = False
         for row in match_rows[:40]:
-            lines.append(_facebook_match_result_line(row))
+            line, skip = _facebook_row_summary_line(row)
+            if line:
+                lines.append(line)
+                any_fb = True
+            else:
+                logger.info(
+                    "[FacebookSummary] skipped row url=%r reason=%r",
+                    row.get("match_url"),
+                    skip,
+                )
+        if not any_fb:
+            lines.append("—")
         if len(match_rows) > 40:
             lines.append(f"… and {len(match_rows) - 40} more matches")
     else:

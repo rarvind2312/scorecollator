@@ -28,7 +28,7 @@ def _highlight_card(title: str, lines: list[str], empty_msg: str) -> str:
     if lines:
         body = "<ul>" + "".join(f"<li>{html.escape(t)}</li>" for t in lines) + "</ul>"
     else:
-        body = f"<p style='color:#6d8582;margin:0'>{html.escape(empty_msg)}</p>"
+        body = f"<p style='color:#2a3d3a;margin:0'>{html.escape(empty_msg)}</p>"
     return (
         f'<div class="highlight-card">'
         f"<h4>{html.escape(title)}</h4>"
@@ -148,27 +148,37 @@ st.markdown(
       font-family: "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
       font-size: clamp(1.38rem, 2.6vw, 1.92rem);
       font-weight: 700;
-      color: #0c4a45;
+      color: #0c4a45 !important;
       letter-spacing: 0.02em;
       line-height: 1.22;
       margin: 0 0 0.4rem 0;
+      -webkit-text-fill-color: #0c4a45 !important;
     }
     .mcc-subtitle {
       font-size: 0.95rem;
-      color: #4a5f5c;
+      color: #2a3d3a !important;
       font-weight: 400;
       line-height: 1.45;
       margin: 0;
       max-width: 38rem;
+      -webkit-text-fill-color: #2a3d3a !important;
     }
     section.main [data-testid="stSelectbox"] label,
     section.main [data-testid="stDateInput"] label,
-    section.main [data-testid="stNumberInput"] label {
+    section.main [data-testid="stNumberInput"] label,
+    section.main [data-testid="stCheckbox"] label,
+    section.main [data-testid="stCheckbox"] p,
+    section.main [data-testid="stCheckbox"] span {
       font-size: 0.72rem !important;
       text-transform: uppercase;
       letter-spacing: 0.07em;
-      color: #5c726f !important;
+      color: #2a3d3a !important;
       font-weight: 600 !important;
+    }
+    section.main [data-testid="stCheckbox"] label {
+      text-transform: none;
+      font-size: 0.95rem !important;
+      letter-spacing: 0.02em;
     }
     .toolbar-align-btn {
       display: flex;
@@ -185,62 +195,85 @@ st.markdown(
       font-family: Georgia, "Times New Roman", serif;
       font-size: 1.08rem;
       line-height: 1.55;
-      color: #1a2e2c;
+      color: #142220 !important;
+      -webkit-text-fill-color: #142220 !important;
     }
     div[data-testid="stMetric"] {
-      background: #fff;
+      background: #fff !important;
       border: 1px solid rgba(12, 74, 69, 0.1);
       border-radius: 12px;
       padding: 0.85rem 1rem 1rem 1rem;
       box-shadow: 0 2px 10px rgba(12, 74, 69, 0.06);
+      color: #142220 !important;
     }
     div[data-testid="stMetricValue"] {
       color: #0c4a45 !important;
       font-weight: 700 !important;
       font-size: 1.85rem !important;
+      -webkit-text-fill-color: #0c4a45 !important;
     }
     div[data-testid="stMetricLabel"] {
-      color: #5c726f !important;
+      color: #3d524f !important;
       font-size: 0.82rem !important;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       font-weight: 600 !important;
+      -webkit-text-fill-color: #3d524f !important;
     }
     .highlight-card {
-      background: #fff;
+      background: #fff !important;
       border: 1px solid rgba(12, 74, 69, 0.11);
       border-radius: 14px;
       padding: 1.15rem 1.25rem 1.35rem 1.25rem;
       box-shadow: 0 3px 16px rgba(12, 74, 69, 0.07);
       height: 100%;
       min-height: 120px;
+      color: #142220 !important;
     }
     .highlight-card h4 {
       font-family: Palatino, Georgia, serif;
       font-size: 1.05rem;
-      color: #0c4a45;
+      color: #0c4a45 !important;
       margin: 0 0 0.75rem 0;
       font-weight: 700;
       letter-spacing: 0.03em;
+      -webkit-text-fill-color: #0c4a45 !important;
     }
     .highlight-card ul {
       margin: 0;
       padding-left: 1.1rem;
-      color: #243330;
+      color: #1a2e2c !important;
       line-height: 1.65;
       font-size: 0.98rem;
+    }
+    .highlight-card li {
+      color: #1a2e2c !important;
     }
     .section-heading {
       font-family: Palatino, Georgia, serif;
       font-size: 1.15rem;
-      color: #0c4a45;
+      color: #0c4a45 !important;
       font-weight: 700;
       margin: 1.5rem 0 0.65rem 0;
       letter-spacing: 0.02em;
+      -webkit-text-fill-color: #0c4a45 !important;
     }
-    .fb-box textarea {
+    section.main [data-testid="stDataFrame"] {
+      color: #142220 !important;
+    }
+    section.main [data-testid="stDataFrame"] [role="grid"],
+    section.main [data-testid="stDataFrame"] [role="row"],
+    section.main [data-testid="stDataFrame"] [role="cell"] {
+      color: #142220 !important;
+      -webkit-text-fill-color: #142220 !important;
+    }
+    .fb-box textarea,
+    section.main .fb-box textarea {
       border-radius: 10px !important;
       border: 1px solid rgba(12, 74, 69, 0.12) !important;
+      color: #142220 !important;
+      background-color: #ffffff !important;
+      -webkit-text-fill-color: #142220 !important;
     }
     div[data-testid="column"] {
       min-width: 0 !important;
@@ -252,6 +285,9 @@ st.markdown(
 
 if "teams_cache" not in st.session_state:
     st.session_state["teams_cache"] = {}
+if st.session_state.get("teams_cache_schema_v") != 2:
+    st.session_state["teams_cache"] = {}
+    st.session_state["teams_cache_schema_v"] = 2
 
 _init_date_range_session_state()
 
@@ -276,6 +312,8 @@ st.markdown(
 )
 
 season_options = list(_cached_season_labels())
+if not season_options:
+    season_options = list(default_season_choices())
 t1, t2, t3, t4, t5, t6 = st.columns([2.0, 1.05, 1.05, 0.95, 0.95, 1.05])
 with t1:
     season = st.selectbox("Season", options=season_options, index=0)
@@ -302,7 +340,21 @@ with t6:
     fetch = st.button("Fetch", type="primary", width="stretch")
     st.markdown("</div>", unsafe_allow_html=True)
 
+cb1, cb2, _ = st.columns([0.42, 0.42, 5.5])
+with cb1:
+    include_juniors = st.checkbox("Juniors", value=True, key="include_juniors")
+with cb2:
+    include_seniors = st.checkbox("Seniors", value=False, key="include_seniors")
+
+_cur_scope = f"{season}|{d0}|{d1}|{int(include_juniors)}|{int(include_seniors)}"
+_prev_report = st.session_state.get("report")
+if _prev_report is not None and _prev_report.get("fetch_scope_key") != _cur_scope:
+    st.session_state.pop("report", None)
+
 if fetch:
+    if not include_juniors and not include_seniors:
+        st.error("Select at least one of Juniors or Seniors.")
+        st.stop()
     with st.status("Fetching…", expanded=True) as status:
         try:
 
@@ -316,6 +368,8 @@ if fetch:
                 min_runs=int(min_runs),
                 min_wickets=int(min_wkts),
                 headless=True,
+                include_juniors=include_juniors,
+                include_seniors=include_seniors,
                 teams_cache=st.session_state["teams_cache"],
                 progress_callback=_prog,
             )
@@ -327,7 +381,7 @@ if fetch:
 
     st.session_state["report"] = data
 
-if "report" in st.session_state:
+if st.session_state.get("report") is not None:
     data = st.session_state["report"]
 
     summary = (data.get("summary_sentence") or "").strip()
@@ -372,8 +426,8 @@ if "report" in st.session_state:
             [
                 {
                     "Date": r["date"],
-                    "Mitcham Team": _truncate(r.get("mitcham_team") or "", 32),
-                    "Opponent": _truncate(r["opponent"], 36),
+                    "Mitcham Team": r.get("mitcham_team") or "",
+                    "Opponent": r["opponent"],
                     "Result": _truncate(r["result"], 44),
                     "Status": r["status"],
                     "Match Link": r["match_url"],
@@ -386,9 +440,9 @@ if "report" in st.session_state:
             column_config={
                 "Date": st.column_config.TextColumn("Date", width="small"),
                 "Mitcham Team": st.column_config.TextColumn(
-                    "Mitcham Team", width="medium"
+                    "Mitcham Team", width="large"
                 ),
-                "Opponent": st.column_config.TextColumn("Opponent", width="medium"),
+                "Opponent": st.column_config.TextColumn("Opponent", width="large"),
                 "Result": st.column_config.TextColumn("Result", width="medium"),
                 "Status": st.column_config.TextColumn("Status", width="small"),
                 "Match Link": st.column_config.LinkColumn(
