@@ -3,11 +3,11 @@ Mitcham CC junior stats — Streamlit front-end for play.cricket.com.au (Playwri
 """
 
 import base64
+import logging
 import calendar
 import html
 import re
 from datetime import date
-from itertools import groupby
 from typing import Literal
 from pathlib import Path
 from typing import Optional
@@ -22,82 +22,79 @@ from scraper import (
     run_report,
 )
 
+logger = logging.getLogger(__name__)
+
 _ASSETS = Path(__file__).resolve().parent / "assets"
 _LOGO_WEBP = _ASSETS / "mitcham_official_logo.webp"
 _LOGO_PNG = _ASSETS / "mitcham_official_logo.png"
 
 
-def _highlight_card(title: str, lines: list[str], empty_msg: str) -> str:
+def _highlight_card(
+    title: str,
+    lines: list[str],
+    empty_msg: str,
+    *,
+    card_extra_class: str = "",
+) -> str:
+    extra = f" {card_extra_class}" if card_extra_class else ""
     if lines:
         body = "<ul>" + "".join(f"<li>{html.escape(t)}</li>" for t in lines) + "</ul>"
     else:
-        body = f"<p style='color:#2a3d3a;margin:0'>{html.escape(empty_msg)}</p>"
+        body = (
+            f"<p style='margin:0;opacity:0.82'>{html.escape(empty_msg)}</p>"
+        )
     return (
-        f'<div class="highlight-card">'
+        f'<div class="highlight-card{extra}">'
         f"<h4>{html.escape(title)}</h4>"
         f"{body}</div>"
     )
 
 
-def _highlight_card_grouped_by_team(
+def _highlight_rows_ordered_flat(data: dict, kind: Literal["bat", "bowl"]) -> list[dict]:
+    """
+    Full highlight rows in run_report order: prefer flat lists; if absent, flatten grouped_*.
+    """
+    fkey = "batting_highlights" if kind == "bat" else "bowling_highlights"
+    gkey = (
+        "grouped_batting_highlights" if kind == "bat" else "grouped_bowling_highlights"
+    )
+    flat = data.get(fkey)
+    if flat is not None:
+        return list(flat)
+    grouped = data.get(gkey)
+    if grouped is not None:
+        out: list[dict] = []
+        for g in grouped:
+            out.extend(g.get("entries") or [])
+        return out
+    return []
+
+
+def _format_highlight_line_with_team(row: dict) -> str:
+    """e.g. Mitcham U14 (1): Player – 29"""
+    fmt = str(row.get("formatted") or "").strip()
+    if not fmt:
+        return ""
+    team = (row.get("mitcham_team") or "").strip() or "Mitcham"
+    return f"{team}: {fmt}"
+
+
+def render_full_highlight_list(
     title: str,
-    highlights: list[dict],
+    rows: list[dict],
     empty_msg: str,
-    *,
-    kind: Literal["bat", "bowl"],
 ) -> str:
-    """Group formatted highlight lines under final Mitcham team names."""
-    if not highlights:
-        return (
-            f'<div class="highlight-card">'
-            f"<h4>{html.escape(title)}</h4>"
-            f"<p style='color:#2a3d3a;margin:0'>{html.escape(empty_msg)}</p>"
-            f"</div>"
-        )
-    if kind == "bat":
-        sort_key = lambda r: (
-            (r.get("mitcham_team") or "").lower(),
-            -int(r.get("runs") or 0),
-            int(r.get("balls") or 0),
-            str(r.get("player") or "").lower(),
-        )
-    else:
-        sort_key = lambda r: (
-            (r.get("mitcham_team") or "").lower(),
-            -int(r.get("wickets") or 0),
-            int(r.get("runs_conceded") or 0),
-            str(r.get("player") or "").lower(),
-        )
-    rows = sorted(highlights, key=sort_key)
-
-    def _team_key(r: dict) -> str:
-        t = (r.get("mitcham_team") or "").strip()
-        return t if t else "Mitcham"
-
-    blocks: list[str] = []
-    for team, group in groupby(rows, key=_team_key):
-        lines = [html.escape(str(r.get("formatted") or "")) for r in group]
-        lines = [ln for ln in lines if ln]
-        if not lines:
-            continue
-        blocks.append(
-            f'<p class="highlight-team-name">{html.escape(team)}</p>'
-            "<ul>"
-            + "".join(f"<li>{ln}</li>" for ln in lines)
-            + "</ul>"
-        )
-    if not blocks:
-        return (
-            f'<div class="highlight-card">'
-            f"<h4>{html.escape(title)}</h4>"
-            f"<p style='color:#2a3d3a;margin:0'>{html.escape(empty_msg)}</p>"
-            f"</div>"
-        )
-    body = "".join(blocks)
-    return (
-        f'<div class="highlight-card">'
-        f"<h4>{html.escape(title)}</h4>"
-        f"{body}</div>"
+    """Single card, one list, all qualifying entries (no expanders, no cap)."""
+    lines: list[str] = []
+    for r in rows:
+        line = _format_highlight_line_with_team(r)
+        if line:
+            lines.append(line)
+    return _highlight_card(
+        title,
+        lines,
+        empty_msg,
+        card_extra_class="highlight-card-full-list",
     )
 
 
@@ -160,6 +157,11 @@ def _on_end_date_changed() -> None:
     st.session_state["end_date_manually_set"] = True
 
 
+def _on_fetch_clicked() -> None:
+    """Ensure fetch + validation run only on an explicit button click, not on other reruns."""
+    st.session_state["_fetch_requested"] = True
+
+
 @st.cache_data(ttl=86_400, show_spinner="Loading season list…")
 def _cached_season_labels() -> tuple[str, ...]:
     try:
@@ -185,14 +187,15 @@ st.markdown(
       padding-right: 2rem !important;
     }
     .stApp {
-      background: linear-gradient(165deg, #faf9f5 0%, #eef2f0 45%, #e8ece9 100%);
+      background: var(--background-color);
+      color: inherit;
     }
     .mcc-header-shell {
       display: flex;
       align-items: flex-start;
       gap: 1.5rem;
       padding: 0.85rem 0.5rem 1.35rem 0.35rem;
-      border-bottom: 1px solid rgba(12, 74, 69, 0.12);
+      border-bottom: 1px solid var(--border-color, rgba(128, 128, 128, 0.22));
       margin-bottom: 0.35rem;
     }
     .mcc-logo-cell {
@@ -227,20 +230,19 @@ st.markdown(
       font-family: "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
       font-size: clamp(1.38rem, 2.6vw, 1.92rem);
       font-weight: 700;
-      color: #0c4a45 !important;
+      color: var(--primary-color, inherit);
       letter-spacing: 0.02em;
       line-height: 1.22;
       margin: 0 0 0.4rem 0;
-      -webkit-text-fill-color: #0c4a45 !important;
     }
     .mcc-subtitle {
       font-size: 0.95rem;
-      color: #2a3d3a !important;
+      color: inherit;
+      opacity: 0.88;
       font-weight: 400;
       line-height: 1.45;
       margin: 0;
       max-width: 38rem;
-      -webkit-text-fill-color: #2a3d3a !important;
     }
     section.main [data-testid="stSelectbox"] label,
     section.main [data-testid="stDateInput"] label,
@@ -251,7 +253,8 @@ st.markdown(
       font-size: 0.72rem !important;
       text-transform: uppercase;
       letter-spacing: 0.07em;
-      color: #2a3d3a !important;
+      color: inherit !important;
+      opacity: 0.88;
       font-weight: 600 !important;
     }
     section.main [data-testid="stCheckbox"] label {
@@ -265,105 +268,111 @@ st.markdown(
       padding-bottom: 0.12rem;
     }
     .summary-card {
-      background: linear-gradient(135deg, #ffffff 0%, #f6faf8 100%);
-      border-left: 4px solid #b8952f;
+      background: var(--secondary-background-color);
+      border-left: 4px solid var(--primary-color, rgba(184, 149, 47, 0.85));
       border-radius: 0 10px 10px 0;
       padding: 1.05rem 1.25rem 1.1rem 1.25rem;
       margin: 1rem 0 1.15rem 0;
-      box-shadow: 0 2px 14px rgba(12, 74, 69, 0.07);
+      box-shadow: 0 2px 14px rgba(0, 0, 0, 0.06);
       font-family: Georgia, "Times New Roman", serif;
       font-size: 1.08rem;
       line-height: 1.55;
-      color: #142220 !important;
-      -webkit-text-fill-color: #142220 !important;
+      color: inherit;
     }
     div[data-testid="stMetric"] {
-      background: #fff !important;
-      border: 1px solid rgba(12, 74, 69, 0.1);
+      background: var(--secondary-background-color) !important;
+      border: 1px solid var(--border-color, rgba(128, 128, 128, 0.28));
       border-radius: 12px;
       padding: 0.85rem 1rem 1rem 1rem;
-      box-shadow: 0 2px 10px rgba(12, 74, 69, 0.06);
-      color: #142220 !important;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+      color: inherit !important;
     }
     div[data-testid="stMetricValue"] {
-      color: #0c4a45 !important;
+      color: var(--primary-color, inherit) !important;
       font-weight: 700 !important;
       font-size: 1.85rem !important;
-      -webkit-text-fill-color: #0c4a45 !important;
     }
     div[data-testid="stMetricLabel"] {
-      color: #3d524f !important;
+      color: inherit !important;
+      opacity: 0.82;
       font-size: 0.82rem !important;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       font-weight: 600 !important;
-      -webkit-text-fill-color: #3d524f !important;
     }
     .highlight-card {
-      background: #fff !important;
-      border: 1px solid rgba(12, 74, 69, 0.11);
+      background: var(--secondary-background-color) !important;
+      border: 1px solid var(--border-color, rgba(128, 128, 128, 0.26));
       border-radius: 14px;
       padding: 1.15rem 1.25rem 1.35rem 1.25rem;
-      box-shadow: 0 3px 16px rgba(12, 74, 69, 0.07);
+      box-shadow: 0 3px 16px rgba(0, 0, 0, 0.06);
       height: 100%;
       min-height: 120px;
-      color: #142220 !important;
+      color: inherit !important;
     }
     .highlight-card h4 {
       font-family: Palatino, Georgia, serif;
       font-size: 1.05rem;
-      color: #0c4a45 !important;
+      color: var(--primary-color, inherit) !important;
       margin: 0 0 0.75rem 0;
       font-weight: 700;
       letter-spacing: 0.03em;
-      -webkit-text-fill-color: #0c4a45 !important;
     }
     .highlight-card ul {
       margin: 0;
       padding-left: 1.1rem;
-      color: #1a2e2c !important;
+      color: inherit !important;
       line-height: 1.65;
       font-size: 0.98rem;
     }
     .highlight-card li {
-      color: #1a2e2c !important;
+      color: inherit !important;
     }
     .highlight-team-name {
       font-family: Palatino, Georgia, serif;
       font-size: 1.0rem;
       font-weight: 700;
-      color: #0c4a45 !important;
+      color: var(--primary-color, inherit) !important;
       margin: 0.75rem 0 0.35rem 0;
-      -webkit-text-fill-color: #0c4a45 !important;
     }
     .highlight-card .highlight-team-name:first-of-type {
       margin-top: 0.35rem;
     }
+    .highlight-card.highlight-card-full-list {
+      height: auto !important;
+      min-height: 0 !important;
+      margin-bottom: 0.75rem;
+    }
+    .highlight-card.highlight-card-full-list ul {
+      font-size: 0.92rem;
+      line-height: 1.55;
+    }
+    .highlight-card.highlight-card-full-list li {
+      word-wrap: break-word;
+      overflow-wrap: anywhere;
+    }
     .section-heading {
       font-family: Palatino, Georgia, serif;
       font-size: 1.15rem;
-      color: #0c4a45 !important;
+      color: var(--primary-color, inherit) !important;
       font-weight: 700;
       margin: 1.5rem 0 0.65rem 0;
       letter-spacing: 0.02em;
-      -webkit-text-fill-color: #0c4a45 !important;
     }
     section.main [data-testid="stDataFrame"] {
-      color: #142220 !important;
+      color: inherit !important;
     }
     section.main [data-testid="stDataFrame"] [role="grid"],
     section.main [data-testid="stDataFrame"] [role="row"],
     section.main [data-testid="stDataFrame"] [role="cell"] {
-      color: #142220 !important;
-      -webkit-text-fill-color: #142220 !important;
+      color: inherit !important;
     }
     .fb-box textarea,
     section.main .fb-box textarea {
       border-radius: 10px !important;
-      border: 1px solid rgba(12, 74, 69, 0.12) !important;
-      color: #142220 !important;
-      background-color: #ffffff !important;
-      -webkit-text-fill-color: #142220 !important;
+      border: 1px solid var(--border-color, rgba(128, 128, 128, 0.28)) !important;
+      color: inherit !important;
+      background-color: var(--secondary-background-color) !important;
     }
     div[data-testid="column"] {
       min-width: 0 !important;
@@ -383,6 +392,22 @@ if "scorecard_cache" not in st.session_state:
 
 _init_date_range_session_state()
 
+with st.sidebar:
+    st.caption("Troubleshooting")
+    if st.button(
+        "Clear cached results",
+        help="Clears the on-screen report and per-URL scorecard cache. Team list cache is kept.",
+    ):
+        st.session_state.pop("report", None)
+        st.session_state["scorecard_cache"] = {}
+        st.session_state.pop("_fetch_run_seq", None)
+        logger.info(
+            "[FetchRuntimeReset] fetch_scope_key=manual_clear cleared_transient_state=True "
+            "cleared_report=True cleared_scorecard_cache=True cleared_locator_state=True "
+            "context=app_user_clear"
+        )
+        st.rerun()
+
 logo_uri = _logo_data_uri()
 logo_html = (
     f'<div class="mcc-logo-cell"><img src="{logo_uri}" alt="Mitcham Cricket Club" /></div>'
@@ -395,8 +420,7 @@ st.markdown(
     <div class="mcc-header-shell">
       {logo_html}
       <div class="mcc-header-text">
-        <h1 class="mcc-title">Mitcham Cricket Club — Junior Stats</h1>
-        <p class="mcc-subtitle">Weekend and date-range junior match highlights</p>
+        <h1 class="mcc-title">Mitcham Cricket Club — Junior & Senior Stats</h1>
       </div>
     </div>
     """,
@@ -438,7 +462,7 @@ elif st.session_state["selected_season"] != st.session_state["previous_selected_
 season = st.session_state["selected_season"]
 
 with t2:
-    d0 = st.date_input("Start date", key="start_date")
+    st.date_input("Start date", key="start_date")
 sd = st.session_state["start_date"]
 pr = st.session_state["_prev_start_date"]
 if sd != pr:
@@ -450,32 +474,76 @@ if sd != pr:
             st.session_state["_fb_syncing_end_from_start"] = False
     st.session_state["_prev_start_date"] = sd
 with t3:
-    d1 = st.date_input("End date", key="end_date", on_change=_on_end_date_changed)
+    st.date_input("End date", key="end_date", on_change=_on_end_date_changed)
+
+if st.session_state["end_date"] < st.session_state["start_date"]:
+    st.session_state["end_date"] = st.session_state["start_date"]
+    st.session_state["_show_date_range_reset_warning"] = True
+    st.rerun()
+
+if st.session_state.pop("_show_date_range_reset_warning", False):
+    st.warning(
+        "End date was before the start date; it has been reset to match the start date."
+    )
+
+d0_eff = st.session_state["start_date"]
+d1_eff = st.session_state["end_date"]
+
 with t4:
     min_runs = st.number_input("Min runs", min_value=0, max_value=400, value=20, step=1)
 with t5:
     min_wkts = st.number_input("Min wickets", min_value=0, max_value=12, value=2, step=1)
 with t6:
     st.markdown('<div class="toolbar-align-btn">', unsafe_allow_html=True)
-    fetch = st.button("Fetch", type="primary", width="stretch")
+    st.button(
+        "Fetch",
+        type="primary",
+        width="stretch",
+        on_click=_on_fetch_clicked,
+        key="fetch_report",
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
-cb1, cb2, _ = st.columns([0.42, 0.42, 5.5])
+cb1, cb2, _ = st.columns([0.42, 0.42, 5.64])
 with cb1:
     include_juniors = st.checkbox("Juniors", value=True, key="include_juniors")
 with cb2:
     include_seniors = st.checkbox("Seniors", value=False, key="include_seniors")
 
-_cur_scope = f"{season}|{d0}|{d1}|{int(include_juniors)}|{int(include_seniors)}"
+# Scorecards are always loaded. Recovery/fallback parsing stays off in the scraper for speed.
+include_scorecards = True
+enable_recovery_parsing = False
+
+_cur_scope = (
+    f"{season}|{d0_eff.isoformat()}|{d1_eff.isoformat()}"
+    f"|{int(include_juniors)}|{int(include_seniors)}|{int(include_scorecards)}"
+    f"|{int(enable_recovery_parsing)}"
+)
 _prev_report = st.session_state.get("report")
 if _prev_report is not None and _prev_report.get("fetch_scope_key") != _cur_scope:
     st.session_state.pop("report", None)
     st.session_state["scorecard_cache"] = {}
 
-if fetch:
+if st.session_state.pop("_fetch_requested", False):
     if not include_juniors and not include_seniors:
         st.error("Select at least one of Juniors or Seniors.")
         st.stop()
+    if d0_eff > d1_eff:
+        st.error("Start date cannot be after end date.")
+        st.stop()
+    _fetch_scope_app = (
+        f"{season}|{d0_eff.isoformat()}|{d1_eff.isoformat()}"
+        f"|{int(include_juniors)}|{int(include_seniors)}|{int(include_scorecards)}"
+        f"|{int(enable_recovery_parsing)}"
+    )
+    st.session_state["_fetch_run_seq"] = int(st.session_state.get("_fetch_run_seq", 0)) + 1
+    st.session_state.pop("_last_fetch_error", None)
+    logger.info(
+        "[FetchRuntimeReset] fetch_scope_key=%r cleared_transient_state=True "
+        "cleared_report=False cleared_scorecard_cache=False cleared_locator_state=True "
+        "context=app_fetch_start",
+        _fetch_scope_app,
+    )
     with st.status("Fetching…", expanded=True) as status:
         try:
 
@@ -484,13 +552,15 @@ if fetch:
 
             data = run_report(
                 season,
-                d0,
-                d1,
+                d0_eff,
+                d1_eff,
                 min_runs=int(min_runs),
                 min_wickets=int(min_wkts),
                 headless=True,
                 include_juniors=include_juniors,
                 include_seniors=include_seniors,
+                include_scorecards=include_scorecards,
+                enable_recovery_parsing=enable_recovery_parsing,
                 teams_cache=st.session_state["teams_cache"],
                 scorecard_cache=st.session_state["scorecard_cache"],
                 progress_callback=_prog,
@@ -519,29 +589,22 @@ if st.session_state.get("report") is not None:
     k4.metric("Games in progress", data.get("in_progress", 0))
 
     st.markdown('<div style="height:0.65rem"></div>', unsafe_allow_html=True)
-    hb1, hb2 = st.columns(2, gap="large")
-    bh = data.get("batting_highlights") or []
-    bo = data.get("bowling_highlights") or []
-    with hb1:
-        st.markdown(
-            _highlight_card_grouped_by_team(
-                "Best with the bat",
-                bh,
-                "No performances reached your minimum runs threshold.",
-                kind="bat",
-            ),
-            unsafe_allow_html=True,
-        )
-    with hb2:
-        st.markdown(
-            _highlight_card_grouped_by_team(
-                "Best with the ball",
-                bo,
-                "No performances reached your minimum wickets threshold.",
-                kind="bowl",
-            ),
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        render_full_highlight_list(
+            "Best with the bat",
+            _highlight_rows_ordered_flat(data, "bat"),
+            "No performances reached your minimum runs threshold.",
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        render_full_highlight_list(
+            "Best with the ball",
+            _highlight_rows_ordered_flat(data, "bowl"),
+            "No performances reached your minimum wickets threshold.",
+        ),
+        unsafe_allow_html=True,
+    )
 
     st.markdown('<p class="section-heading">Match results</p>', unsafe_allow_html=True)
     rows = data.get("match_rows") or []

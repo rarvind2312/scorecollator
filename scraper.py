@@ -9,8 +9,9 @@ import os
 import re
 import time
 from collections import defaultdict
+from itertools import groupby
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import parse_qs, urlparse
@@ -26,15 +27,93 @@ if not logger.handlers:
 
 
 def _perf(label: str, t0: float) -> None:
-    logger.info("%s: %.2fs", label, time.perf_counter() - t0)
+    # Perf logging is emitted as structured [Perf] lines in run_report.
+    return
+
+
+def _mitcham_team_key(r: dict[str, Any]) -> str:
+    t = (r.get("mitcham_team") or "").strip()
+    return t if t else "Mitcham"
+
+
+def group_highlights_by_mitcham_team(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Split highlight rows into [{mitcham_team, entries}, ...].
+    Rows must already be sorted so all rows for a team are consecutive.
+    """
+    if not rows:
+        return []
+    out: list[dict[str, Any]] = []
+    for team, grp in groupby(rows, key=_mitcham_team_key):
+        out.append({"mitcham_team": team, "entries": list(grp)})
+    return out
+
+
+def _flatten_grouped_highlight_entries(
+    grouped: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """None if grouped is None (caller should fall back to flat lists)."""
+    if grouped is None:
+        return None
+    out: list[dict[str, Any]] = []
+    for g in grouped:
+        out.extend(g.get("entries") or [])
+    return out
 
 
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+#
+# Debug env flags removed (keep scraper deterministic / low-overhead).
+#
+
+
+def is_match_in_progress(status_text: str, raw_result_text: str) -> bool:
+    """
+    True for live / multi-day / partial scorecard states. Never True for Completed.
+    """
+    st = (status_text or "").strip()
+    if not st:
+        return False
+    sl = st.lower()
+    if sl == "completed":
+        return False
+    if sl in ("abandoned", "cancelled"):
+        return False
+    combined = f"{st} {raw_result_text or ''}".lower()
+    markers = (
+        "stumps",
+        "tea",
+        "lunch",
+        "day 1",
+        "day 2",
+        "day 3",
+        "in progress",
+        "live",
+        "yet to resume",
+        "scheduled continuation",
+    )
+    if any(m in combined for m in markers):
+        return True
+    return True
+
+
+def normalize_card_status_for_ui(card_status: str) -> str:
+    """Match Results / metrics: Completed and Abandoned preserved; else In Progress."""
+    cs = (card_status or "").strip()
+    if cs == "Completed":
+        return "Completed"
+    if cs == "Abandoned":
+        return "Abandoned"
+    return "In Progress"
+
+
 def _debug_browser_season() -> bool:
-    return _env_truthy("MITCHAM_DEBUG_BROWSER")
+    return False
 
 
 @dataclass
@@ -43,6 +122,128 @@ class BattingRow:
     runs: int
     balls: int
     not_out: bool
+    side_owner: str = field(default="unknown")
+    source_method: str = field(default="chip")
+    source_confidence: str = field(default="medium")
+
+
+@dataclass
+class BowlingRow:
+    player: str
+    wickets: int
+    runs_conceded: int
+    side_owner: str = field(default="unknown")
+    source_method: str = field(default="chip")
+    source_confidence: str = field(default="medium")
+
+
+def _tag_batting_slice(
+    rows: list[BattingRow],
+    start: int,
+    *,
+    side_owner: str,
+    source_method: str,
+    source_confidence: str,
+) -> None:
+    for r in rows[start:]:
+        r.side_owner = side_owner
+        r.source_method = source_method
+        r.source_confidence = source_confidence
+
+
+def _tag_bowling_slice(
+    rows: list[BowlingRow],
+    start: int,
+    *,
+    side_owner: str,
+    source_method: str,
+    source_confidence: str,
+) -> None:
+    for r in rows[start:]:
+        r.side_owner = side_owner
+        r.source_method = source_method
+        r.source_confidence = source_confidence
+
+
+def _fixture_both_sides_mitcham_named(rep: ScorecardExtractReport) -> bool:
+    fh_h = (rep.fixture_header_home_team or "").strip()
+    fh_a = (rep.fixture_header_away_team or "").strip()
+    if not fh_h or not fh_a:
+        return False
+    return _mitcham_in_string(fh_h) and _mitcham_in_string(fh_a)
+
+
+def _opponent_distinct_team_tokens_vs_mitcham(
+    resolved: dict[str, Any],
+) -> set[str]:
+    """Tokens in opponent label but not in Mitcham team (e.g. yellow vs black)."""
+    mt = _team_tokens_for_matching(resolved.get("mitcham_team") or "")
+    ot = _team_tokens_for_matching(resolved.get("opponent") or "")
+    return {t for t in ot if t not in mt and len(t) >= 3}
+
+
+def _innings_label_matches_resolved_mitcham_side(
+    lab: str,
+    resolved: dict[str, Any] | None,
+    rep: ScorecardExtractReport,
+) -> bool:
+    """
+    Mitcham batting innings label/chip/heading: when both fixture sides are Mitcham-named,
+    require a distinct Mitcham-side token (e.g. black) in the label.
+    """
+    if not _innings_is_mitcham(lab):
+        return False
+    if not resolved:
+        return True
+    if not _fixture_both_sides_mitcham_named(rep):
+        return True
+    distinct = _mitcham_distinct_team_tokens_vs_opponent(resolved)
+    lab_l = (lab or "").lower()
+    if not distinct:
+        return False
+    return any(len(t) >= 3 and t in lab_l for t in distinct)
+
+
+def _innings_label_matches_resolved_opposition_bowling_tab(
+    lab: str,
+    resolved: dict[str, Any] | None,
+    rep: ScorecardExtractReport,
+) -> bool:
+    """
+    Innings where the opposition batted (Mitcham bowling card). Excludes our Mitcham
+    batting innings; for same-club fixtures uses distinct opponent tokens (e.g. yellow).
+    """
+    if not resolved:
+        return not _innings_is_mitcham(lab)
+    if not _fixture_both_sides_mitcham_named(rep):
+        return not _innings_is_mitcham(lab)
+    if _innings_label_matches_resolved_mitcham_side(lab, resolved, rep):
+        return False
+    o_dist = _opponent_distinct_team_tokens_vs_mitcham(resolved)
+    lab_l = (lab or "").lower()
+    if o_dist and any(t in lab_l for t in o_dist):
+        return True
+    return not _innings_is_mitcham(lab)
+
+
+def _log_highlight_guard_rail(
+    *,
+    url: str,
+    mitcham_team: str,
+    player_name: str,
+    side_owner: str,
+    source_method: str,
+    reason: str,
+) -> None:
+    logger.debug(
+        "[HighlightGuardRail] url=%s mitcham_team=%r player=%r side_owner=%s method=%s reason=%s",
+        url,
+        mitcham_team,
+        player_name,
+        side_owner,
+        source_method,
+        reason,
+    )
 
 
 def _dismissal_not_out(dismissal: str) -> bool:
@@ -229,6 +430,221 @@ def _parse_first_match_date(card_text: str) -> date | None:
         return None
 
 
+def _extract_scheduled_dates_from_fixture_text(*parts: str) -> list[date]:
+    """Distinct dates found in fixture card / scorecard metadata text."""
+    blob = "\n".join((p or "") for p in parts)
+    seen: set[date] = set()
+    for m in re.finditer(
+        r",\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s+at\b",
+        blob,
+        flags=re.I,
+    ):
+        d, mon, y = int(m.group(1)), m.group(2).lower(), int(m.group(3))
+        mi = MONTHS.get(mon)
+        if not mi:
+            continue
+        try:
+            seen.add(date(y, mi, d))
+        except ValueError:
+            pass
+    for m in re.finditer(
+        r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\b",
+        blob,
+    ):
+        d, mon, y = int(m.group(1)), m.group(2).lower(), int(m.group(3))
+        mi = MONTHS.get(mon)
+        if not mi:
+            continue
+        try:
+            seen.add(date(y, mi, d))
+        except ValueError:
+            continue
+    return sorted(seen)
+
+
+def fixture_overlaps_selected_window(
+    item: dict[str, Any],
+    raw_fixture_text: str,
+    selected_date_from: date,
+    selected_date_to: date,
+) -> tuple[bool, dict[str, Any]]:
+    """
+    True if the fixture's primary date or any parsed scheduled date falls inside
+    [selected_date_from, selected_date_to]. Used at discovery time before metadata.
+
+    When the card lists no extra day but indicates 2-day or split innings, a
+    synthetic second day (primary + 7 days) is added for overlap (week-2 discovery).
+    """
+    debug: dict[str, Any] = {
+        "primary_match_date": None,
+        "scheduled_dates_detected": [],
+        "overlap_reason": None,
+        "team_category": item.get("team_category"),
+        "multi_day_type_detected": None,
+        "used_fallback_second_day": False,
+        "fallback_second_day": None,
+    }
+    md = item.get("md")
+    if isinstance(md, date):
+        debug["primary_match_date"] = md.isoformat()
+
+    mdt = _detect_multi_day_type(raw_fixture_text)
+    debug["multi_day_type_detected"] = mdt
+
+    parsed = _extract_scheduled_dates_from_fixture_text(raw_fixture_text)
+    extra_from_text: set[date] = set(parsed)
+    if isinstance(md, date):
+        extra_from_text.discard(md)
+
+    seen: set[date] = set()
+    if isinstance(md, date):
+        seen.add(md)
+    seen.update(parsed)
+
+    fallback_d: date | None = None
+    if (
+        isinstance(md, date)
+        and not extra_from_text
+        and mdt in ("2_day", "split_innings")
+    ):
+        fallback_d = md + timedelta(days=7)
+        seen.add(fallback_d)
+        debug["used_fallback_second_day"] = True
+        debug["fallback_second_day"] = fallback_d.isoformat()
+
+    candidate_dates = sorted(seen)
+    debug["scheduled_dates_detected"] = [d.isoformat() for d in candidate_dates]
+
+    if not candidate_dates:
+        debug["overlap_reason"] = "no_overlap"
+        return False, debug
+
+    in_range_dates = [
+        d for d in candidate_dates if selected_date_from <= d <= selected_date_to
+    ]
+    if not in_range_dates:
+        debug["overlap_reason"] = "no_overlap"
+        return False, debug
+
+    primary_in = isinstance(md, date) and selected_date_from <= md <= selected_date_to
+    if primary_in:
+        debug["overlap_reason"] = "primary_date_in_range"
+        return True, debug
+
+    for d in in_range_dates:
+        if d in extra_from_text:
+            debug["overlap_reason"] = "scheduled_date_in_range"
+            return True, debug
+    if fallback_d is not None and fallback_d in in_range_dates:
+        debug["overlap_reason"] = "fallback_second_day_in_range"
+        return True, debug
+    debug["overlap_reason"] = "scheduled_date_in_range"
+    return True, debug
+
+
+def _log_fixture_window_overlap(
+    match_url: str,
+    selected_date_from: date,
+    selected_date_to: date,
+    *,
+    team_category: Any,
+    multi_day_type_detected: str | None,
+    used_fallback_second_day: bool,
+    fallback_second_day: str | None,
+    primary_match_date: str | None,
+    scheduled_dates_detected: list[str],
+    overlap_result: bool,
+    overlap_reason: str | None,
+) -> None:
+    # Removed (verbose).
+    return
+
+
+def _detect_multi_day_type(blob: str) -> str | None:
+    low = (blob or "").lower()
+    if "split innings" in low or "split-innings" in low or "splitinnings" in low:
+        return "split_innings"
+    if (
+        re.search(r"\b2\s*[- ]?\s*day\b", low)
+        or "two day" in low
+        or "two-day" in low
+        or "2-day" in low
+    ):
+        return "2_day"
+    return None
+
+
+def is_partial_window_for_match(
+    item: dict[str, Any],
+    rep: Any,
+    selected_date_from: date,
+    selected_date_to: date,
+) -> tuple[bool, dict[str, Any]]:
+    """
+    True when the user's date range only covers the first segment of a multi-day
+    / split fixture — use partial display and earliest-innings stats.
+    """
+    debug: dict[str, Any] = {
+        "scheduled_dates_detected": [],
+        "multi_day_type_detected": None,
+        "partial_window_reason": None,
+    }
+    card = item.get("card") or ""
+    blob = getattr(rep, "raw_match_team_blob", None) or ""
+    page_lines = list(getattr(rep, "scorecard_result_lines", None) or [])
+    fh_res = getattr(rep, "fixture_header_result_text", None) or ""
+    combined = "\n".join([card, blob, fh_res, "\n".join(page_lines)])
+
+    dates = _extract_scheduled_dates_from_fixture_text(
+        card, blob, fh_res, "\n".join(page_lines)
+    )
+    md = item.get("md")
+    if isinstance(md, date):
+        dates = sorted(set(dates) | {md})
+    debug["scheduled_dates_detected"] = [d.isoformat() for d in dates]
+
+    mdt = _detect_multi_day_type(combined)
+    debug["multi_day_type_detected"] = mdt
+
+    tc = item.get("team_category")
+    status = (item.get("status") or "").strip()
+
+    if len(dates) >= 2 and max(dates) > selected_date_to:
+        debug["partial_window_reason"] = "later_scheduled_date_beyond_window"
+        return True, debug
+
+    if (
+        mdt
+        and tc == "senior_men"
+        and isinstance(md, date)
+        and status == "Completed"
+        and selected_date_from <= md <= selected_date_to
+        and (selected_date_to - md).days <= 4
+        and selected_date_to < md + timedelta(days=7)
+    ):
+        if len(dates) <= 1:
+            debug["partial_window_reason"] = "multi_day_format_narrow_window_first_block"
+            return True, debug
+
+    return False, debug
+
+
+def _log_partial_window_decision(
+    match_url: str,
+    match_date: date | None,
+    selected_date_from: date,
+    selected_date_to: date,
+    raw_card_status: str,
+    display_status: str,
+    *,
+    partial_window_match: bool,
+    scheduled_dates_detected: list[str],
+    multi_day_type_detected: str | None,
+    partial_window_reason: str | None,
+) -> None:
+    return
+
+
 def _mitcham_in_string(s: str) -> bool:
     return "mitcham" in (s or "").lower()
 
@@ -292,36 +708,33 @@ def _log_match_validation(
     ok: bool,
     reject_reason: str,
 ) -> None:
-    msg = (
-        f"[MatchValidation] url={url!r} "
-        f"discovered_team_label={discovered_label!r} "
-        f"fixture_header_home_team={getattr(rep, 'fixture_header_home_team', '')!r} "
-        f"fixture_header_away_team={getattr(rep, 'fixture_header_away_team', '')!r} "
-        f"resolved_mitcham_team={resolved.get('resolved_mitcham_team')!r} "
-        f"resolved_opponent={resolved.get('resolved_opponent')!r} "
-        f"final_mitcham_team={resolved.get('mitcham_team')!r} "
-        f"final_opponent_team={resolved.get('opponent')!r} "
-        f"normalized_result={resolved.get('result')!r} "
-        f"is_valid_mitcham_match={ok!r} "
-        f"reject_reason={reject_reason!r}"
-    )
-    if ok:
-        if _env_truthy("MITCHAM_MATCH_VALIDATION_VERBOSE"):
-            logger.info(msg)
-        else:
-            logger.debug(msg)
-    else:
-        logger.info(msg)
+    # Removed (verbose / debug-only).
+    return
 
 
 def match_status_from_card(card_text: str) -> str:
     u = card_text.upper()
+    low = card_text.lower()
     if "COMPLETED" in u:
         return "Completed"
-    if "IN PROGRESS" in u or "LIVE" in u:
-        return "In progress"
     if "ABANDONED" in u or "CANCELLED" in u:
         return "Abandoned"
+    prog_markers = (
+        "stumps",
+        "tea",
+        "lunch",
+        "day 1",
+        "day 2",
+        "day 3",
+        "in progress",
+        "live",
+        "yet to resume",
+        "scheduled continuation",
+    )
+    if any(m in low for m in prog_markers):
+        return "In progress"
+    if "IN PROGRESS" in u or "LIVE" in u:
+        return "In progress"
     return "Other"
 
 
@@ -1773,17 +2186,40 @@ def _resolve_match_row_fields(
     final_opponent_team = cleaned_opponent
 
     page_lines = list(getattr(rep, "scorecard_result_lines", None) or [])
-    result_from_fixture = None
-    if fh_result and status == "Completed":
-        result_from_fixture = normalize_fixture_header_result_to_compact(
-            fh_result,
-            final_mitcham_team,
-            final_opponent_team if final_opponent_team not in ("—", "-") else None,
-            oc,
-        )
-    if result_from_fixture:
-        result = result_from_fixture
-    else:
+    raw_status_result_blob = "\n".join(
+        [card, fh_result or "", "\n".join(page_lines)]
+    )
+    if status == "Completed":
+        result_from_fixture = None
+        if fh_result:
+            result_from_fixture = normalize_fixture_header_result_to_compact(
+                fh_result,
+                final_mitcham_team,
+                final_opponent_team if final_opponent_team not in ("—", "-") else None,
+                oc,
+            )
+        if result_from_fixture:
+            result = result_from_fixture
+        else:
+            result = normalize_match_result_display(
+                status,
+                oc,
+                card,
+                page_lines,
+                mitch if mitch != "—" else None,
+                opp if opp != "—" else None,
+            )
+            if result == "Completed" and status == "Completed":
+                inferred2 = _infer_result_from_broad_blob(
+                    card,
+                    page_lines,
+                    oc,
+                    final_mitcham_team,
+                    final_opponent_team if final_opponent_team not in ("—", "-") else None,
+                )
+                if inferred2 and inferred2 != "Completed":
+                    result = inferred2
+    elif status == "Abandoned":
         result = normalize_match_result_display(
             status,
             oc,
@@ -1792,16 +2228,9 @@ def _resolve_match_row_fields(
             mitch if mitch != "—" else None,
             opp if opp != "—" else None,
         )
-        if result == "Completed" and status == "Completed":
-            inferred2 = _infer_result_from_broad_blob(
-                card,
-                page_lines,
-                oc,
-                final_mitcham_team,
-                final_opponent_team if final_opponent_team not in ("—", "-") else None,
-            )
-            if inferred2 and inferred2 != "Completed":
-                result = inferred2
+    else:
+        result = "In Progress"
+    display_status = normalize_card_status_for_ui(status)
     raw_log = _raw_result_snippet_for_log(card, page_lines)
     parsed_pair = f"({vs_m!r}, {vs_o!r})"
     return {
@@ -1816,6 +2245,8 @@ def _resolve_match_row_fields(
         "final_opponent": final_opponent_team,
         "junior_fast9_super7": junior_fast9_super7,
         "result": result,
+        "display_status": display_status,
+        "raw_status_result_blob": raw_status_result_blob[:2000],
         "raw_teams_log": (
             f"card=({card_m!r},{card_o!r}); "
             f"discovered_team_label={disc!r}; "
@@ -1878,7 +2309,9 @@ def _facebook_row_summary_line(
     mt = str(row.get("mitcham_team") or "").strip()
     opp = str(row.get("opponent") or "").strip()
     res = str(row.get("result") or "").strip()
-    status = str(row.get("status") or "").strip()
+    status = str(
+        row.get("display_status") or row.get("status") or ""
+    ).strip()
 
     if not _facebook_mitcham_field_usable(mt):
         return None, "mitcham_unusable"
@@ -1911,10 +2344,10 @@ def _facebook_row_summary_line(
             return None, "tie_no_opponent"
         return f"{mt} vs {opp} — {res or 'Draw'}", None
 
-    if status == "In progress":
+    if status.lower() == "in progress" or res_l == "in progress":
         if ou:
-            return f"{mt} vs {opp} — In progress", None
-        return f"{mt} — In progress", None
+            return f"{mt} vs {opp} — In Progress", None
+        return f"{mt} — In Progress", None
 
     if not res_is_vague():
         if ou:
@@ -1934,6 +2367,7 @@ def _log_match_results_row(
     resolved: dict[str, Any],
     status: str,
 ) -> None:
+    return
     opp = resolved.get("opponent") or "—"
     if opp == "—":
         pair_note = " opponent_unresolved"
@@ -1964,7 +2398,13 @@ def _log_match_results_row(
         f"final_mitcham_team={resolved.get('final_mitcham_team')!r} "
         f"final_opponent_team={resolved.get('final_opponent')!r} "
         f"raw_result={resolved.get('raw_result_log')!r} "
-        f"normalized_result={resolved.get('result')!r} status={status!r}"
+        f"normalized_result={resolved.get('result')!r} status={status!r} "
+        f"display_status={resolved.get('display_status')!r} "
+        f"partial_window_match={resolved.get('partial_window_match')!r} "
+        f"scheduled_dates_detected={resolved.get('scheduled_dates_detected')!r} "
+        f"multi_day_type_detected={resolved.get('multi_day_type_detected')!r} "
+        f"partial_window_reason={resolved.get('partial_window_reason')!r} "
+        f"window_partial_for_range={resolved.get('window_partial_for_range')!r}"
         f"{pair_note} "
         f"facebook_line={fb_line!r} facebook_skip_reason={fb_skip!r}"
     )
@@ -1990,13 +2430,7 @@ def _log_match_results_row(
             )
     except OSError:
         pass
-    if _env_truthy("MITCHAM_MATCH_RESULTS_DEBUG"):
-        try:
-            logf = Path(__file__).resolve().parent / "match_results_metadata.log"
-            with logf.open("a", encoding="utf-8") as fh:
-                fh.write(msg + "\n")
-        except Exception:
-            pass
+    # Debug-only file log removed.
 
 
 def default_season_choices(today: date | None = None) -> list[str]:
@@ -2033,14 +2467,14 @@ def build_summary_sentence(
     else:
         tone = "an"
     if scope == "senior":
-        who = "Mitcham senior sides had"
+        who = "Mitcham Senior sides had"
     elif scope == "both":
-        who = "Mitcham teams (juniors and seniors) had"
+        who = "Mitcham teams (Juniors and Seniors) had"
     else:
-        who = "Mitcham juniors had"
+        who = "Mitcham Juniors had"
     return (
         f"{who} {tone} outing in the selected period with results showing "
-        f"{wins} wins, {losses} losses, {draws} draws/ties and {in_progress} games in progress."
+        f"{wins} wins,   {losses} losses,   {draws} draws/ties  and   {in_progress} games in progress."
     )
 
 
@@ -2065,26 +2499,47 @@ def _parse_int_runs(s: str) -> int | None:
     return None
 
 
+def _row_looks_like_batting_stats_header(cells: list[str]) -> bool:
+    """Another Batsman/R/B header row mid-table (e.g. second innings in same grid)."""
+    if not cells:
+        return False
+    ir = _col_index(cells, "runs")
+    ib = _col_index(cells, "balls")
+    return ir is not None and ib is not None
+
+
 def parse_batting_table(rows: list[list[str]]) -> list[BattingRow]:
-    """Batting rows from scorecard table; dismissal column sets not_out."""
+    """Batting rows from scorecard table; dismissal column sets not_out.
+
+    Handles split-innings / multiple batting blocks: scans the full table for every
+    Runs+Balls header row and ends each block at extras/total/bowling/fall-of/next header.
+    """
     if not rows:
         return []
-    for start in range(min(10, len(rows))):
+    max_scan = min(len(rows), 500)
+    all_out: list[BattingRow] = []
+    for start in range(max_scan):
         header = rows[start]
         ir = _col_index(header, "runs")
         ib = _col_index(header, "balls")
         if ir is None or ib is None:
             continue
-        out: list[BattingRow] = []
+        block: list[BattingRow] = []
         for cells in rows[start + 1 :]:
             if len(cells) <= max(ir, ib):
                 continue
+            if _row_looks_like_batting_stats_header(cells):
+                break
             name = (cells[0] or "").strip()
             low = name.lower()
             if not name or low == "batting":
                 continue
+            if low == "bowling" or low.startswith("bowling "):
+                break
+            if "fall of wicket" in low or low.startswith("fall of"):
+                break
             if low == "extras" or low.startswith("total"):
-                continue
+                break
             if "did not bat" in low:
                 continue
             dismissal = (cells[1] if len(cells) > 1 else "") or ""
@@ -2098,10 +2553,10 @@ def parse_batting_table(rows: list[list[str]]) -> list[BattingRow]:
             if not clean_name:
                 continue
             not_out = _dismissal_not_out(dismissal)
-            out.append(BattingRow(player=clean_name, runs=rn, balls=bl, not_out=not_out))
-        if out:
-            return out
-    return []
+            block.append(BattingRow(player=clean_name, runs=rn, balls=bl, not_out=not_out))
+        if block:
+            all_out.extend(block)
+    return all_out
 
 
 def _safe_int(s: str) -> int | None:
@@ -2290,15 +2745,20 @@ def _parse_bowling_table_with_meta(
     Parse bowling table; return (rows, header, indices, first raw data rows,
     normalized rows for best header, up to 20 for logging).
     Canonical tuple: (player_name, wickets, runs_conceded).
+
+    Supports split-innings: multiple bowling blocks in one table (each valid header
+    row starts a block; ends at total/extras/next header).
     """
     if not rows:
         return [], None, None, [], []
+    merged: list[tuple[str, int, int]] = []
     best: list[tuple[str, int, int]] = []
     best_header: list[str] | None = None
     best_idx: tuple[int, int, int] | None = None
     best_raw_data: list[list[str]] = []
     best_norm_data: list[list[str]] = []
-    for start in range(min(10, len(rows))):
+    max_start = min(len(rows), 500)
+    for start in range(max_start):
         header = rows[start]
         idx = _bowling_column_indices(header)
         if idx is None:
@@ -2306,29 +2766,41 @@ def _parse_bowling_table_with_meta(
         pi, wi, ri = idx
         out: list[tuple[str, int, int]] = []
         for cells in rows[start + 1 :]:
+            if _bowling_column_indices(cells) is not None:
+                break
             try:
                 norm = _normalize_bowling_data_row(cells, header)
+                pl_name = (norm[pi] if pi < len(norm) else "").strip()
+                low = pl_name.lower()
+                if low in ("bowling", "bowler"):
+                    break
+                if low.startswith("total") or low == "extras":
+                    break
                 parsed = _parse_bowling_row_mapped(norm, pi, wi, ri)
                 if parsed:
                     out.append(parsed)
             except Exception:
                 continue
-        if len(out) > len(best):
-            best = out
-            best_header = header
-            best_idx = idx
-            best_raw_data = rows[start + 1 : start + 21]
-            best_norm_data = [
-                _normalize_bowling_data_row(c, header)
-                for c in best_raw_data
-            ]
-    return best, best_header, best_idx, best_raw_data, best_norm_data
+        if out:
+            merged.extend(out)
+            if len(out) > len(best):
+                best = out
+                best_header = header
+                best_idx = idx
+                best_raw_data = rows[start + 1 : start + 21]
+                best_norm_data = [
+                    _normalize_bowling_data_row(c, header)
+                    for c in best_raw_data
+                ]
+    return merged, best_header, best_idx, best_raw_data, best_norm_data
 
 
-def parse_bowling_table(rows: list[list[str]]) -> list[tuple[str, int, int]]:
-    """Return (player_name, wickets, runs_conceded) using header column mapping."""
+def parse_bowling_table(rows: list[list[str]]) -> list[BowlingRow]:
+    """Return bowling rows using header column mapping."""
     parsed, _, _, _, _ = _parse_bowling_table_with_meta(rows)
-    return parsed
+    return [
+        BowlingRow(player=n, wickets=w, runs_conceded=r) for n, w, r in parsed
+    ]
 
 
 def _scrape_tables(page: Page) -> list[list[list[str]]]:
@@ -2494,13 +2966,7 @@ def _snapshot_scorecard_dom_when_empty(
     _scorecard_extract_log(
         f"SCORECARD_SNAPSHOT url={match_url} text_preview={tx!r} html_preview={hx!r}"
     )
-    if _env_truthy("MITCHAM_SCORECARD_DEBUG"):
-        try:
-            logf = Path(__file__).resolve().parent / "scorecard_dom_snapshot.log"
-            with logf.open("a", encoding="utf-8") as fh:
-                fh.write(f"\n--- {match_url} ---\n{snap.get('text', '')}\n")
-        except Exception:
-            pass
+    # Debug-only file snapshot removed.
 
 
 def _scrape_scorecard_row_matrices(page: Page) -> list[list[list[str]]]:
@@ -2783,15 +3249,14 @@ def _dedupe_batting_rows(rows: list[BattingRow]) -> list[BattingRow]:
     return out
 
 
-def _dedupe_bowling_rows(
-    rows: list[tuple[str, int, int]],
-) -> list[tuple[str, int, int]]:
+def _dedupe_bowling_rows(rows: list[BowlingRow]) -> list[BowlingRow]:
     seen: set[tuple[str, int, int]] = set()
-    out: list[tuple[str, int, int]] = []
+    out: list[BowlingRow] = []
     for t in rows:
-        if t in seen:
+        k = (t.player.lower(), t.wickets, t.runs_conceded)
+        if k in seen:
             continue
-        seen.add(t)
+        seen.add(k)
         out.append(t)
     return out
 
@@ -2799,27 +3264,22 @@ def _dedupe_bowling_rows(
 def _extend_batting_from_matrices(
     matrices: list[list[list[str]]], acc: list[BattingRow]
 ) -> int:
+    """Parse every batting table matrix; parse_batting_table scans full table for all innings."""
     n = 0
     for tbl in matrices:
         if not tbl:
             continue
         if "batting" not in _table_text_blob(tbl, 16):
             continue
-        hit = False
-        for off in range(min(10, len(tbl))):
-            sub = tbl[off:]
-            rows = parse_batting_table(sub)
-            if rows:
-                acc.extend(rows)
-                hit = True
-                break
-        if hit:
+        rows = parse_batting_table(tbl)
+        if rows:
+            acc.extend(rows)
             n += 1
     return n
 
 
 def _extend_bowling_from_matrices(
-    matrices: list[list[list[str]]], acc: list[tuple[str, int, int]]
+    matrices: list[list[list[str]]], acc: list[BowlingRow]
 ) -> tuple[int, dict[str, Any] | None]:
     """
     Append all bowling rows from each bowling table (best slice per table).
@@ -2847,7 +3307,10 @@ def _extend_bowling_from_matrices(
                 best_raw = raw
                 best_norm = norm
         if best:
-            acc.extend(best)
+            acc.extend(
+                BowlingRow(player=n, wickets=w, runs_conceded=r)
+                for n, w, r in best
+            )
             n += 1
             if best_header is not None and best_idx is not None:
                 cand = {
@@ -2866,7 +3329,12 @@ def _extend_bowling_from_matrices(
 def _parse_flat_scorecard_by_headings(
     page: Page,
     all_bat: list[BattingRow],
-    all_bowl: list[tuple[str, int, int]],
+    all_bowl: list[BowlingRow],
+    resolved: dict[str, Any] | None,
+    rep: ScorecardExtractReport,
+    *,
+    include_batting: bool = True,
+    include_bowling: bool = True,
 ) -> tuple[int, int]:
     """When innings chips are absent: use heading + inningsHint to classify sections."""
     secs = _scorecard_heading_sections(page)
@@ -2887,15 +3355,66 @@ def _parse_flat_scorecard_by_headings(
             + " "
             + (sec.get("sectionContext") or "")
         )
+        ctx = (sec.get("sectionContext") or "")[:200]
         if kind == "batting":
-            if _innings_is_mitcham(hint) or _innings_is_mitcham(
-                (sec.get("sectionContext") or "")[:200]
-            ):
-                br = parse_batting_table(rows)
-                if br:
-                    all_bat.extend(br)
-                    bat_tables += 1
+            if not include_batting:
+                continue
+            br = parse_batting_table(rows)
+            if not br:
+                continue
+            n0 = len(all_bat)
+            all_bat.extend(br)
+            lab = hint.strip()
+            comb = f"{lab} {ctx}".strip().lower()
+            if _innings_label_matches_resolved_mitcham_side(
+                lab, resolved, rep
+            ) or _innings_label_matches_resolved_mitcham_side(ctx, resolved, rep):
+                _tag_batting_slice(
+                    all_bat,
+                    n0,
+                    side_owner="mitcham",
+                    source_method="fallback",
+                    source_confidence="medium",
+                )
+            elif resolved and _fixture_both_sides_mitcham_named(rep):
+                o_dist = _opponent_distinct_team_tokens_vs_mitcham(resolved)
+                if o_dist and any(t in comb for t in o_dist):
+                    _tag_batting_slice(
+                        all_bat,
+                        n0,
+                        side_owner="opponent",
+                        source_method="fallback",
+                        source_confidence="medium",
+                    )
+                else:
+                    _tag_batting_slice(
+                        all_bat,
+                        n0,
+                        side_owner="unknown",
+                        source_method="fallback",
+                        source_confidence="low",
+                    )
+            else:
+                if _innings_is_mitcham(lab) or _innings_is_mitcham(ctx):
+                    _tag_batting_slice(
+                        all_bat,
+                        n0,
+                        side_owner="mitcham",
+                        source_method="fallback",
+                        source_confidence="medium",
+                    )
+                else:
+                    _tag_batting_slice(
+                        all_bat,
+                        n0,
+                        side_owner="opponent",
+                        source_method="fallback",
+                        source_confidence="medium",
+                    )
+            bat_tables += 1
         elif kind == "bowling":
+            if not include_bowling:
+                continue
             # Mitcham bowling: opponent batted this innings — hint is not Mitcham's batting innings.
             h = hint.strip()
             if h and _innings_is_mitcham(h):
@@ -2903,23 +3422,34 @@ def _parse_flat_scorecard_by_headings(
             if not h and len(bowling_secs) != 1:
                 continue
             bw = parse_bowling_table(rows)
-            if bw:
-                all_bowl.extend(bw)
-                bowl_tables += 1
+            if not bw:
+                continue
+            n1 = len(all_bowl)
+            all_bowl.extend(bw)
+            _tag_bowling_slice(
+                all_bowl,
+                n1,
+                side_owner="mitcham",
+                source_method="fallback",
+                source_confidence="medium",
+            )
+            bowl_tables += 1
     return bat_tables, bowl_tables
 
 
 def _parse_scorecard_full_page_matrices_mitcham_batting(
     page: Page,
     all_bat: list[BattingRow],
+    *,
+    matrices: list[list[list[str]]] | None = None,
 ) -> int:
     """
     Last resort: batting matrices whose text blob suggests Mitcham's innings.
     (Bowling is handled via heading-based sections — avoid guessing from grids alone.)
     """
-    matrices = _all_scorecard_matrices(page)
+    mats = matrices if matrices is not None else _all_scorecard_matrices(page)
     bat_n = 0
-    for tbl in matrices:
+    for tbl in mats:
         blob = _table_text_blob(tbl, min(24, len(tbl)))
         low = blob.lower()
         if "batting" not in low:
@@ -2929,17 +3459,525 @@ def _parse_scorecard_full_page_matrices_mitcham_batting(
             or re.search(r"\d+\s*(st|nd|rd|th)\s+mit\b", low)
         ):
             continue
-        hit = False
-        for off in range(min(10, len(tbl))):
-            sub = tbl[off:]
-            br = parse_batting_table(sub)
-            if br:
-                all_bat.extend(br)
-                hit = True
-                break
-        if hit:
+        br = parse_batting_table(tbl)
+        if br:
+            n0 = len(all_bat)
+            all_bat.extend(br)
+            _tag_batting_slice(
+                all_bat,
+                n0,
+                side_owner="mitcham",
+                source_method="fallback",
+                source_confidence="medium",
+            )
             bat_n += 1
     return bat_n
+
+
+def _collect_batting_blocks_from_all_matrices(
+    page: Page,
+) -> list[tuple[list[BattingRow], str]]:
+    """
+    Every distinct batting table on the scorecard (no Mitcham keyword filter).
+    Skips duplicate parses by a short row fingerprint.
+    """
+    _scroll_scorecard_tables_into_view(page)
+    matrices = _all_scorecard_matrices(page)
+    out: list[tuple[list[BattingRow], str]] = []
+    seen_fp: set[str] = set()
+    for tbl in matrices:
+        if not tbl:
+            continue
+        blob = _table_text_blob(tbl, min(36, len(tbl)))
+        if "batting" not in blob.lower():
+            continue
+        rows = parse_batting_table(tbl)
+        if not rows:
+            continue
+        fp = "|".join(f"{r.player.lower()}:{r.runs}:{r.balls}" for r in rows[:12])
+        if fp in seen_fp:
+            continue
+        seen_fp.add(fp)
+        out.append((rows, blob))
+    return out
+
+
+_TEAM_MATCHING_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "xi",
+        "grade",
+        "shield",
+        "overs",
+        "players",
+        "split",
+        "innings",
+        "one",
+        "day",
+        "under",
+        "men",
+        "women",
+        "junior",
+        "senior",
+        "cricket",
+        "club",
+        "the",
+        "and",
+        "match",
+        "team",
+        "nth",
+        "st",
+        "nd",
+        "rd",
+        "th",
+    }
+)
+
+
+def _team_tokens_for_matching(name: str) -> set[str]:
+    """Strong lowercase tokens from a team label; excludes weak/generic words."""
+    raw = re.sub(r"[^a-zA-Z0-9\s\-]", " ", (name or "").lower())
+    raw = re.sub(r"\s+", " ", raw).strip()
+    out: set[str] = set()
+    for p in raw.replace("-", " ").split():
+        if len(p) < 3:
+            continue
+        if p in _TEAM_MATCHING_STOPWORDS:
+            continue
+        out.add(p)
+    if "mitcham" in raw:
+        out.add("mitcham")
+    return out
+
+
+def _mitcham_opponent_token_hits(
+    blob_lower: str,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+) -> tuple[int, int]:
+    """Rough hit counts for Mitcham vs opposition tokens in blob text."""
+    mtoks = _team_tokens_for_matching(resolved.get("mitcham_team") or "")
+    otoks = _team_tokens_for_matching(resolved.get("opponent") or "")
+    m_hits = 0
+    for t in mtoks:
+        if len(t) >= 3 and t in blob_lower:
+            m_hits += 1
+    if "mitcham" in blob_lower:
+        m_hits += 4
+    if re.search(r"(?i)\bmit\b", blob_lower) or re.search(
+        r"(?i)\d+(?:st|nd|rd|th)\s+mit\b", blob_lower
+    ):
+        m_hits += 3
+    o_hits = 0
+    for t in otoks:
+        if len(t) >= 3 and t in blob_lower:
+            o_hits += 1
+    fh_h = (rep.fixture_header_home_team or "").strip()
+    fh_a = (rep.fixture_header_away_team or "").strip()
+    if _mitcham_in_string(fh_h):
+        for t in _team_tokens_for_matching(fh_h):
+            if len(t) >= 3 and t in blob_lower and t != "mitcham":
+                m_hits += 1
+    if _mitcham_in_string(fh_a):
+        for t in _team_tokens_for_matching(fh_a):
+            if len(t) >= 3 and t in blob_lower and t != "mitcham":
+                m_hits += 1
+    if fh_h and not _mitcham_in_string(fh_h):
+        for t in _team_tokens_for_matching(fh_h):
+            if len(t) >= 4 and t in blob_lower:
+                o_hits += 1
+    if fh_a and not _mitcham_in_string(fh_a):
+        for t in _team_tokens_for_matching(fh_a):
+            if len(t) >= 4 and t in blob_lower:
+                o_hits += 1
+    return m_hits, o_hits
+
+
+def _has_literal_mitcham_in_blob(blob_lower: str) -> bool:
+    return "mitcham" in blob_lower
+
+
+def _has_literal_mit_innings_markers(blob_lower: str) -> bool:
+    """Mitcham innings chip / abbreviation signals (not substring of unrelated words)."""
+    if re.search(r"(?i)\bmit\b", blob_lower):
+        return True
+    if re.search(r"(?i)\d+(?:st|nd|rd|th)\s+mit\b", blob_lower):
+        return True
+    if "mit " in blob_lower or "mit-" in blob_lower or "mit(" in blob_lower:
+        return True
+    return False
+
+
+def _has_mitcham_blob_signals(blob_lower: str) -> bool:
+    """True if blob has literal Mitcham name or MIT innings markers."""
+    return _has_literal_mitcham_in_blob(blob_lower) or _has_literal_mit_innings_markers(
+        blob_lower
+    )
+
+
+def _count_strong_mitcham_resolved_team_tokens(
+    blob_lower: str, resolved: dict[str, Any]
+) -> int:
+    mtoks = _team_tokens_for_matching(resolved.get("mitcham_team") or "")
+    return sum(1 for t in mtoks if len(t) >= 3 and t in blob_lower)
+
+
+def _mitcham_distinct_team_tokens_vs_opponent(resolved: dict[str, Any]) -> set[str]:
+    """Tokens present in Mitcham team name but not in opponent (e.g. black vs yellow)."""
+    mt = _team_tokens_for_matching(resolved.get("mitcham_team") or "")
+    ot = _team_tokens_for_matching(resolved.get("opponent") or "")
+    return {t for t in mt if t not in ot and len(t) >= 3}
+
+
+def _blob_aligns_with_mitcham_fixture_side(
+    blob_lower: str, rep: ScorecardExtractReport
+) -> bool:
+    """
+    Fixture lists Mitcham on home or away; blob text clearly matches that Mitcham label.
+    """
+    for label in (
+        (rep.fixture_header_home_team or "").strip(),
+        (rep.fixture_header_away_team or "").strip(),
+    ):
+        if not label or not _mitcham_in_string(label):
+            continue
+        ll = label.lower()
+        if len(ll) >= 10 and ll[: min(90, len(ll))] in blob_lower:
+            return True
+        mtoks = _team_tokens_for_matching(label)
+        hits = sum(1 for t in mtoks if len(t) >= 3 and t in blob_lower)
+        if hits >= 2:
+            return True
+        if "mitcham" in blob_lower and hits >= 1:
+            return True
+    return False
+
+
+def _blob_aligns_with_non_mitcham_fixture_side(
+    blob_lower: str, rep: ScorecardExtractReport
+) -> bool:
+    """Blob matches the opponent's fixture team name (home or away), not Mitcham."""
+    for label in (
+        (rep.fixture_header_home_team or "").strip(),
+        (rep.fixture_header_away_team or "").strip(),
+    ):
+        if not label or _mitcham_in_string(label):
+            continue
+        ll = label.lower()
+        if len(ll) >= 10 and ll[: min(90, len(ll))] in blob_lower:
+            return True
+        otoks = _team_tokens_for_matching(label)
+        hits = sum(1 for t in otoks if len(t) >= 4 and t in blob_lower)
+        if hits >= 2:
+            return True
+    return False
+
+
+def _is_confident_mitcham_batting_block(
+    _rows: list[BattingRow],
+    blob_lower: str,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+) -> bool:
+    """
+    Hard gate: accept a recovered batting block as Mitcham only with strong evidence.
+    """
+    if _has_literal_mitcham_in_blob(blob_lower):
+        return True
+    distinct = _mitcham_distinct_team_tokens_vs_opponent(resolved)
+    if _has_literal_mit_innings_markers(blob_lower):
+        if not distinct:
+            return True
+        if any(t in blob_lower for t in distinct):
+            return True
+        if _blob_aligns_with_mitcham_fixture_side(blob_lower, rep):
+            return True
+        return False
+    m_hits, o_hits = _mitcham_opponent_token_hits(blob_lower, rep, resolved)
+    strong_tok = _count_strong_mitcham_resolved_team_tokens(blob_lower, resolved)
+    if strong_tok >= 2 and o_hits < m_hits:
+        return True
+    if _blob_aligns_with_mitcham_fixture_side(blob_lower, rep):
+        return True
+    return False
+
+
+def _is_confident_opponent_batting_block(
+    _rows: list[BattingRow],
+    blob_lower: str,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+) -> bool:
+    """
+    Hard reject: never use this block for Mitcham batting recovery when True.
+    """
+    m_hits, o_hits = _mitcham_opponent_token_hits(blob_lower, rep, resolved)
+    if o_hits >= 2 and m_hits == 0:
+        return True
+    if o_hits > m_hits and not _has_mitcham_blob_signals(blob_lower):
+        return True
+    if _blob_aligns_with_non_mitcham_fixture_side(blob_lower, rep):
+        if not _has_mitcham_blob_signals(blob_lower):
+            return True
+    return False
+
+
+def _is_plausible_mitcham_batting_block(
+    rows: list[BattingRow],
+    blob_lower: str,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+) -> bool:
+    """
+    Softer acceptance than confident_mitcham: still excludes confident_opponent
+    blocks (caller must not weaken opponent rejection).
+    """
+    if _is_confident_opponent_batting_block(rows, blob_lower, rep, resolved):
+        return False
+    has_strong = _count_strong_mitcham_resolved_team_tokens(blob_lower, resolved) >= 1
+    pos_signal = (
+        _has_literal_mitcham_in_blob(blob_lower)
+        or _has_literal_mit_innings_markers(blob_lower)
+        or has_strong
+        or _blob_aligns_with_mitcham_fixture_side(blob_lower, rep)
+    )
+    if not pos_signal:
+        return False
+    distinct = _mitcham_distinct_team_tokens_vs_opponent(resolved)
+    if not distinct:
+        return True
+    if any(t in blob_lower for t in distinct):
+        return True
+    if _blob_aligns_with_mitcham_fixture_side(blob_lower, rep):
+        return True
+    return False
+
+
+def _block_looks_like_opposition_only_batting(
+    blob_lower: str,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+) -> bool:
+    """True when blob evidence is clearly opposition innings, not Mitcham."""
+    if "mitcham" in blob_lower:
+        return False
+    if re.search(r"(?i)\bmit\b", blob_lower) or re.search(
+        r"(?i)\d+(?:st|nd|rd|th)\s+mit\b", blob_lower
+    ):
+        return False
+    m_hits, o_hits = _mitcham_opponent_token_hits(blob_lower, rep, resolved)
+    if m_hits >= 2:
+        return False
+    if o_hits >= 2 and m_hits == 0:
+        return True
+    if o_hits >= 3 and m_hits <= 1:
+        return True
+    if o_hits >= m_hits + 3 and o_hits >= 4:
+        return True
+    return False
+
+
+def _block_looks_like_mitcham_batting(
+    _rows: list[BattingRow],
+    blob_lower: str,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+) -> bool:
+    """
+    True only when Mitcham-side evidence outweighs opposition for this batting block.
+    """
+    b = blob_lower
+    if "mitcham" in b:
+        return True
+    if re.search(r"(?i)\bmit\b", b) or re.search(
+        r"(?i)\d+(?:st|nd|rd|th)\s+mit\b", b
+    ):
+        return True
+    m_hits, o_hits = _mitcham_opponent_token_hits(b, rep, resolved)
+    if _block_looks_like_opposition_only_batting(b, rep, resolved):
+        return False
+    if m_hits >= 2 and m_hits > o_hits:
+        return True
+    if m_hits >= 1 and o_hits == 0:
+        return True
+    meta_blob = (
+        (rep.raw_match_team_blob or "")
+        + " "
+        + " ".join(rep.scorecard_result_lines or [])
+    ).lower()
+    mt = (resolved.get("mitcham_team") or "").strip().lower()
+    if mt and len(mt) >= 8 and mt[: min(60, len(mt))] in meta_blob:
+        if m_hits >= o_hits:
+            return True
+    return m_hits > o_hits and m_hits >= 2
+
+
+def _score_mitcham_batting_block_likeness(
+    rows: list[BattingRow],
+    blob_lower: str,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+) -> float:
+    """Higher = more likely Mitcham batting (not opposition). Used to rank Mitcham blocks."""
+    s = 0.0
+    b = blob_lower
+    if "mitcham" in b:
+        s += 160.0
+    if re.search(r"(?i)\bmit\b", b) or re.search(
+        r"(?i)\d+(?:st|nd|rd|th)\s+mit\b", b
+    ):
+        s += 110.0
+    m_hits, o_hits = _mitcham_opponent_token_hits(b, rep, resolved)
+    s += m_hits * 18.0
+    s -= o_hits * 35.0
+    mt = (resolved.get("mitcham_team") or "").strip().lower()
+    if mt:
+        for tok in _team_tokens_for_matching(mt):
+            if tok in b and tok != "mitcham":
+                s += 14.0
+    fh_h = (rep.fixture_header_home_team or "").strip().lower()
+    fh_a = (rep.fixture_header_away_team or "").strip().lower()
+    if _mitcham_in_string(fh_h) and fh_h[:90] in b:
+        s += 45.0
+    if _mitcham_in_string(fh_a) and fh_a[:90] in b:
+        s += 45.0
+    opp = (resolved.get("opponent") or "").strip().lower()
+    if opp:
+        for tok in _team_tokens_for_matching(opp):
+            if tok in b and "mitcham" not in b and not re.search(r"\bmit\b", b):
+                s -= 55.0
+                break
+    if fh_h and not _mitcham_in_string(fh_h) and fh_h[:50] in b:
+        s -= 40.0
+    if fh_a and not _mitcham_in_string(fh_a) and fh_a[:50] in b:
+        s -= 40.0
+    if rows:
+        s += min(len(rows), 12) * 2.0
+        s += min(sum(r.runs for r in rows), 500) * 0.015
+    return s
+
+
+def _attempt_full_page_mitcham_batting_recovery(
+    page: Page,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any],
+    *,
+    min_runs: int,
+    match_url: str,
+) -> tuple[list[BattingRow], dict[str, Any]]:
+    """
+    When normal innings/tab path yields no batting rows: scan all scorecard batting
+    tables. Reject confident-opposition blocks; prefer confident Mitcham blocks, else
+    plausible Mitcham blocks; no unrestricted best-score fallback.
+    """
+    blocks = _collect_batting_blocks_from_all_matrices(page)
+    dbg: dict[str, Any] = {
+        "url": match_url,
+        "candidate_blocks_found": len(blocks),
+        "method_used": "full_page_matrix_scan_mitcham_only",
+    }
+    if not blocks:
+        return [], dbg
+
+    scored: list[tuple[list[BattingRow], str, float, dict[str, Any]]] = []
+    for rows, blob in blocks:
+        bl = blob.lower()
+        sc = _score_mitcham_batting_block_likeness(rows, bl, rep, resolved)
+        m_hits, o_hits = _mitcham_opponent_token_hits(bl, rep, resolved)
+        conf_m = _is_confident_mitcham_batting_block(rows, bl, rep, resolved)
+        conf_o = _is_confident_opponent_batting_block(rows, bl, rep, resolved)
+        plausible_m = _is_plausible_mitcham_batting_block(rows, bl, rep, resolved)
+        has_lit_m = _has_literal_mitcham_in_blob(bl)
+        has_lit_i = _has_literal_mit_innings_markers(bl)
+        preview = re.sub(r"\s+", " ", blob)[:140]
+        if conf_o:
+            selection_tier: Literal["confident", "plausible", "rejected"] = "rejected"
+            reject_reason: str | None = "confident_opponent"
+        elif conf_m:
+            selection_tier = "confident"
+            reject_reason = None
+        elif plausible_m:
+            selection_tier = "plausible"
+            reject_reason = None
+        else:
+            selection_tier = "rejected"
+            reject_reason = "not_confident_or_plausible_mitcham"
+        meta = {
+            "blob_preview": preview,
+            "score": round(sc, 2),
+            "mitcham_token_hits": m_hits,
+            "opponent_token_hits": o_hits,
+            "confident_mitcham": conf_m,
+            "confident_opponent": conf_o,
+            "plausible_mitcham": plausible_m,
+            "selection_tier": selection_tier,
+            "has_literal_mitcham": has_lit_m,
+            "has_literal_mit": has_lit_i,
+            "selected": False,
+            "reject_reason": reject_reason,
+        }
+        scored.append((rows, blob, sc, meta))
+
+    remaining = [t for t in scored if not t[3]["confident_opponent"]]
+    tier_confident = [t for t in remaining if t[3]["confident_mitcham"]]
+    tier_plausible = [t for t in remaining if t[3]["plausible_mitcham"]]
+    survivors = tier_confident if tier_confident else tier_plausible
+    if not survivors:
+        dbg["method_used"] = "rejected_ambiguous_blocks"
+        return [], dbg
+
+    best = max(survivors, key=lambda x: x[2])
+    best[3]["selected"] = True
+    best[3]["reject_reason"] = None
+    used_tier = "confident" if tier_confident else "plausible"
+    dbg["method_used"] = (
+        "full_page_matrix_scan_confident_mitcham"
+        if used_tier == "confident"
+        else "full_page_matrix_scan_plausible_mitcham"
+    )
+    for t in survivors:
+        if t is not best:
+            t[3]["reject_reason"] = "not_selected_lower_score"
+
+    merged: list[BattingRow] = list(best[0])
+    merged = _dedupe_batting_rows(merged)
+    mu = str(dbg.get("method_used") or "")
+    if mu == "full_page_matrix_scan_plausible_mitcham":
+        for r in merged:
+            r.side_owner = "unknown"
+            r.source_method = "full_page_recovery"
+            r.source_confidence = "low"
+    elif mu == "full_page_matrix_scan_confident_mitcham":
+        for r in merged:
+            r.side_owner = "mitcham"
+            r.source_method = "full_page_recovery"
+            r.source_confidence = "high"
+    else:
+        for r in merged:
+            r.side_owner = "unknown"
+            r.source_method = "full_page_recovery"
+            r.source_confidence = "low"
+    return merged, dbg
+
+
+#
+# Debug-only log helpers removed.
+#
+
+
+def _log_highlight_final_counts(
+    batting_highlights: list[dict[str, Any]],
+    bowling_highlights: list[dict[str, Any]],
+    grouped_bat: list[dict[str, Any]],
+    grouped_bowl: list[dict[str, Any]],
+) -> None:
+    logger.info(
+        "[HighlightFinalCounts] batting_total_rows=%d bowling_total_rows=%d "
+        "grouped_batting_team_count=%d grouped_bowling_team_count=%d",
+        len(batting_highlights or []),
+        len(bowling_highlights or []),
+        len(grouped_bat or []),
+        len(grouped_bowl or []),
+    )
 
 
 def _batting_table_fingerprint(tables: list[list[list[str]]]) -> str:
@@ -3212,30 +4250,127 @@ def _ordered_dedupe_season_labels(labels: list[str]) -> list[str]:
     return out
 
 
-def discover_season_labels_from_page(page: Page) -> list[str]:
-    """Read season labels from the Play Cricket club Teams tab dropdown (simple path)."""
-    t0 = time.perf_counter()
-    page.goto(f"{CLUB_PAGE}?tab=teams", wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(900)
-    wrap = page.locator(".o-dropdown__select-wrapper").filter(
-        has_text=re.compile(r"Summer\s+20")
-    ).first
-    wrap.wait_for(state="visible", timeout=15_000)
-    _open_club_season_dropdown(page)
-    page.wait_for_timeout(220)
-    raw: list[Any] = page.evaluate(
+def _wait_organisation_season_dropdown_open(page: Page, timeout_ms: int = 8_000) -> bool:
+    """True when panel is open: aria-expanded on wrapper and/or list items mounted."""
+    try:
+        page.wait_for_function(
+            """() => {
+          const wrap = document.querySelector('#organisation-seasons-options');
+          if (wrap && wrap.getAttribute('aria-expanded') === 'true') return true;
+          const ul = document.querySelector('#organisation-seasons-options-list');
+          if (!ul) return false;
+          return ul.querySelectorAll('li.o-dropdown__options-item').length > 0;
+        }""",
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _collect_season_labels_from_organisation_dropdown(page: Page) -> list[str]:
+    """
+    Read labels from opened #organisation-seasons list only (aria-label / button / li text).
+    Scrolls the list so virtualized / long histories expose every season row.
+    """
+    raw = page.evaluate(
         r"""() => {
+          const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+          const seen = new Set();
           const out = [];
-          const re = /^Summer\s+\d{4}\/\d{2}/;
-          for (const el of document.querySelectorAll(
-            '[role="option"], button, a, li, span, div'
-          )) {
-            const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
-            if (re.test(t) && t.length < 80) out.push(t);
+          const pushLabel = (t) => {
+            const n = norm(t);
+            if (!n || seen.has(n)) return;
+            seen.add(n);
+            out.push(n);
+          };
+          const readItems = () => {
+            const items = document.querySelectorAll(
+              '#organisation-seasons-options-list li.o-dropdown__options-item'
+            );
+            for (const li of items) {
+              const btn = li.querySelector('button.o-dropdown__item-trigger');
+              let t = '';
+              if (btn) {
+                t = (btn.getAttribute('aria-label') || '').trim();
+                if (!t) {
+                  t = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+                }
+              }
+              if (!t) {
+                t = (li.textContent || '').replace(/\s+/g, ' ').trim();
+              }
+              if (t) pushLabel(t);
+            }
+          };
+          const listEl = document.querySelector('#organisation-seasons-options-list')
+            || document.querySelector('#organisation-seasons-options');
+          if (listEl && listEl.scrollHeight > listEl.clientHeight) {
+            const step = Math.max(48, Math.floor(listEl.clientHeight * 0.45) || 80);
+            let maxH = listEl.scrollHeight;
+            for (let pass = 0; pass < 3; pass++) {
+              for (let top = 0; top <= maxH + step; top += step) {
+                listEl.scrollTop = Math.min(top, listEl.scrollHeight);
+                maxH = Math.max(maxH, listEl.scrollHeight);
+                readItems();
+              }
+              maxH = listEl.scrollHeight;
+            }
+            listEl.scrollTop = 0;
+            readItems();
+          } else {
+            readItems();
           }
           return out;
         }"""
     )
+    if not isinstance(raw, list):
+        return []
+    return [str(x) for x in raw]
+
+
+def discover_season_labels_from_page(page: Page) -> list[str]:
+    """Read season labels from #organisation-seasons dropdown list (DOM source of truth)."""
+    t0 = time.perf_counter()
+    page.goto(f"{CLUB_PAGE}?tab=teams", wait_until="domcontentloaded", timeout=120_000)
+    page.wait_for_timeout(900)
+    trig = page.locator("#organisation-seasons").first
+    trig.wait_for(state="visible", timeout=15_000)
+
+    dropdown_opened = False
+    for attempt in range(2):
+        try:
+            trig.click(timeout=12_000)
+            page.wait_for_timeout(200)
+            if _wait_organisation_season_dropdown_open(page, 8_000):
+                dropdown_opened = True
+                break
+        except Exception as ex:
+            logger.info(
+                "[SeasonDiscovery] open_attempt=%d error=%r",
+                attempt + 1,
+                ex,
+            )
+        page.wait_for_timeout(400)
+
+    raw_texts: list[str] = []
+    if dropdown_opened:
+        try:
+            raw_texts = _collect_season_labels_from_organisation_dropdown(page)
+        except Exception as ex:
+            logger.warning("[SeasonDiscovery] collect_from_list failed: %s", ex)
+    else:
+        logger.warning(
+            "[SeasonDiscovery] dropdown_opened=False — could not open #organisation-seasons"
+        )
+
+    logger.info(
+        "[SeasonDiscovery] dropdown_opened=%s raw_count=%d raw=%s",
+        dropdown_opened,
+        len(raw_texts),
+        raw_texts,
+    )
+
     try:
         page.keyboard.press("Escape")
     except Exception:
@@ -3246,9 +4381,13 @@ def discover_season_labels_from_page(page: Page) -> list[str]:
         m = re.search(r"Summer\s+(\d{4})/", s)
         return -int(m.group(1)) if m else 0
 
-    deduped = _ordered_dedupe_season_labels([str(x) for x in (raw or [])])
+    deduped = _ordered_dedupe_season_labels(raw_texts)
     labels = sorted(deduped, key=season_sort_key)
-    logger.info("Season discovery: count=%d labels=%s", len(labels), labels)
+    logger.info(
+        "Season discovery: count=%d labels=%s",
+        len(labels),
+        labels,
+    )
     _perf("season label discovery", t0)
     return labels
 
@@ -3324,15 +4463,8 @@ def _click_innings_toggle(page: Page, label: str) -> None:
 
 
 def _scorecard_extract_log(msg: str) -> None:
-    if not _env_truthy("MITCHAM_SCORECARD_DEBUG"):
-        return
-    logger.info("[ScorecardExtract] %s", msg)
-    try:
-        logf = Path(__file__).resolve().parent / "scorecard_extraction.log"
-        with logf.open("a", encoding="utf-8") as fh:
-            fh.write(msg + "\n")
-    except Exception:
-        pass
+    # Removed (debug-only).
+    return
 
 
 def _table_text_blob(tbl: list[list[str]], max_rows: int = 12) -> str:
@@ -3362,11 +4494,12 @@ class ScorecardExtractReport:
     batting_rows: int = 0
     bowling_rows: int = 0
     note: str = ""
-    bowling_header_row: list[str] | None = None
-    bowling_column_indices: tuple[int, int, int] | None = None
-    bowling_expected_columns: int | None = None
-    bowling_raw_rows_first20: list[list[str]] = field(default_factory=list)
-    bowling_norm_rows_first20: list[list[str]] = field(default_factory=list)
+    used_batting_recovery: bool = False
+    used_bowling_recovery: bool = False
+    normal_parse_sec: float = 0.0
+    fallback_parse_sec: float = 0.0
+    skipped_no_relevant_scope: bool = False
+    relevant_scope_reason: str = ""
 
 
 def _log_scorecard_report(rep: ScorecardExtractReport) -> None:
@@ -3387,6 +4520,203 @@ def _log_scorecard_report(rep: ScorecardExtractReport) -> None:
             + ([f"note={rep.note}"] if rep.note else [])
         )
     )
+
+
+def _batting_row_debug_repr(br: BattingRow) -> str:
+    return f"{br.player} {br.runs}/{br.balls} no={br.not_out}"
+
+
+#
+# Debug-only extraction log removed.
+#
+
+
+def _metadata_suggests_two_team_completed_innings(
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any] | None,
+) -> bool:
+    """
+    Heuristic: page metadata suggests a normal two-team completed scorecard with Mitcham involved.
+    Used to gate innings-chip recovery (avoid firing on junk pages).
+    """
+    parts = [
+        rep.raw_match_team_blob or "",
+        rep.fixture_header_home_team or "",
+        rep.fixture_header_away_team or "",
+        rep.fixture_header_result_text or "",
+        " ".join(rep.scorecard_result_lines or []),
+    ]
+    blob = " ".join(parts).lower()
+    if not _mitcham_in_string(blob):
+        return False
+    fh_h = (rep.fixture_header_home_team or "").strip()
+    fh_a = (rep.fixture_header_away_team or "").strip()
+    if fh_h and fh_a:
+        if _mitcham_in_string(fh_h) ^ _mitcham_in_string(fh_a):
+            return True
+    if resolved:
+        opp = (resolved.get("opponent") or "").strip()
+        if opp and not _mitcham_in_string(opp):
+            return True
+    if len(re.findall(r"\d+\s*[-/]\s*\d+", blob)) >= 2:
+        return True
+    if " v " in blob or " vs " in blob:
+        return True
+    return False
+
+
+def has_incomplete_completed_innings_discovery(
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any] | None,
+    *,
+    match_completed: bool,
+) -> bool:
+    """
+    True when chip/toggle discovery is asymmetric or too sparse for a two-team scorecard,
+    so a page-wide DOM recovery pass should run.
+    """
+    if not match_completed:
+        return False
+    if not _metadata_suggests_two_team_completed_innings(rep, resolved):
+        return False
+    toggles = list(rep.toggles or rep.innings_chips_detected or [])
+    mbu = list(rep.mitcham_batting_tabs_used or [])
+    obu = list(rep.opposition_innings_for_bowling or [])
+    if len(toggles) <= 1:
+        return True
+    if not mbu:
+        return True
+    if not obu:
+        return True
+    return False
+
+
+def _innings_discovery_fallback_extract(
+    page: Page,
+    match_url: str,
+    all_bat: list[BattingRow],
+    all_bowl: list[BowlingRow],
+    resolved: dict[str, Any] | None,
+    rep: ScorecardExtractReport,
+    *,
+    recover_batting: bool = True,
+    recover_bowling: bool = True,
+    matrices: list[list[list[str]]] | None = None,
+) -> tuple[int, int, dict[str, Any]]:
+    """
+    Page-wide recovery without relying on innings chips: heading sections + all matrices.
+    Does not invent data — only parses tables already in the DOM.
+    """
+    mats = matrices if matrices is not None else _all_scorecard_matrices(page)
+    n_tables = len(mats)
+    n_bat0 = len(all_bat)
+    n_bowl0 = len(all_bowl)
+
+    hb = hbw = 0
+    hmit = 0
+    hit_b = 0
+    if recover_batting or recover_bowling:
+        hb, hbw = _parse_flat_scorecard_by_headings(
+            page,
+            all_bat,
+            all_bowl,
+            resolved,
+            rep,
+            include_batting=recover_batting,
+            include_bowling=recover_bowling,
+        )
+    if recover_batting:
+        hmit = _parse_scorecard_full_page_matrices_mitcham_batting(
+            page, all_bat, matrices=mats
+        )
+    if recover_bowling:
+        n_before_matrix_bowl = len(all_bowl)
+        hit_b, _ = _extend_bowling_from_matrices(mats, all_bowl)
+        if hit_b:
+            _tag_bowling_slice(
+                all_bowl,
+                n_before_matrix_bowl,
+                side_owner="mitcham",
+                source_method="fallback",
+                source_confidence="medium",
+            )
+
+    bat_blocks = hb + hmit
+    bowl_blocks = hbw + hit_b
+    bat_added = all_bat[n_bat0:]
+    bowl_added = all_bowl[n_bowl0:]
+    info: dict[str, Any] = {
+        "tables_scanned": n_tables,
+        "bat_blocks": bat_blocks,
+        "bowl_blocks": bowl_blocks,
+        "bat_rows_delta": len(bat_added),
+        "bowl_rows_delta": len(bowl_added),
+        "heading_bat_blocks": hb,
+        "heading_bowl_blocks": hbw,
+        "matrix_mitcham_bat_blocks": hmit,
+        "matrix_bowl_blocks": hit_b,
+    }
+    return bat_blocks, bowl_blocks, info
+
+
+#
+# Innings recovery log removed (debug-only / verbose).
+#
+
+
+#
+# Batting extraction fallback log removed.
+#
+
+
+#
+# Bowling extraction fallback log removed.
+#
+
+
+def _log_match_highlight_contribution(
+    match_url: str,
+    mitcham_team: str,
+    bats: list[BattingRow],
+    bowls: list[BowlingRow],
+    min_runs: int,
+    min_wickets: int,
+) -> None:
+    # Removed (debug-only, heavy string building).
+    return
+
+
+def select_partial_innings_scope(
+    rep: ScorecardExtractReport, completed_match: bool
+) -> dict[str, Any]:
+    """
+    For completed matches, use all toggles. For partial / in-progress, only the
+    earliest visible innings (display order from rep.toggles).
+    """
+    toggles = list(rep.toggles or rep.innings_chips_detected or [])
+    if completed_match:
+        return {
+            "mode": "full",
+            "available_toggles": toggles,
+            "selected_toggles": list(toggles),
+            "extraction_mode": "full",
+        }
+    if not toggles:
+        return {
+            "mode": "partial",
+            "available_toggles": [],
+            "selected_toggles": [],
+            "extraction_mode": "partial",
+            "earliest_is_mitcham": None,
+        }
+    earliest = toggles[0]
+    return {
+        "mode": "partial",
+        "available_toggles": toggles,
+        "selected_toggles": [earliest],
+        "extraction_mode": "partial",
+        "earliest_is_mitcham": _innings_is_mitcham(earliest),
+    }
 
 
 def scrape_match_scorecard_metadata_only(
@@ -3437,116 +4767,37 @@ def scrape_match_scorecard_metadata_only(
     except Exception:
         pass
 
-    if _env_truthy("MITCHAM_SCORECARD_DEBUG"):
-        try:
-            probe = _scorecard_dom_probe(page)
-            _log_scorecard_dom_probe(match_url, probe)
-        except Exception as e:
-            rep.note = (rep.note + f" dom_probe_err:{e!r};").strip()
-
     return rep
 
 
-def scrape_match_scorecard_batting_bowling(
+def _open_match_summary_without_scorecard(
     page: Page,
-    rep: ScorecardExtractReport,
-) -> tuple[list[BattingRow], list[tuple[str, int, int]], ScorecardExtractReport]:
+    match_url: str,
+    match_date: date | None = None,
+) -> ScorecardExtractReport:
     """
-    Batting/bowling extraction only. Page must already be on this match's scorecard.
+    Single goto to the match page; fixture header + blob/result lines without Scorecard tab.
+    Used for fixtures-only mode, abandoned rows, and validation when scorecard stats are skipped.
     """
-    match_url = rep.match_url
-    all_bat: list[BattingRow] = []
-    all_bowl: list[tuple[str, int, int]] = []
-    bat_tables_total = 0
-    bowl_tables_total = 0
+    rep = ScorecardExtractReport(match_url=match_url, scorecard_reached=False)
+    try:
+        page.goto(match_url, wait_until="domcontentloaded", timeout=120_000)
+        page.wait_for_timeout(240)
+        rep.scorecard_reached = True
+    except Exception as e:
+        rep.note = f"goto_failed:{e!r}"
+        return rep
 
-    if _env_truthy("MITCHAM_SCORECARD_DEBUG"):
-        try:
-            probe = _scorecard_dom_probe(page)
-            _log_scorecard_dom_probe(match_url, probe)
-        except Exception as e:
-            rep.note = (rep.note + f" dom_probe_err:{e!r};").strip()
+    # Fixture header is usually visible on the match page without opening Scorecard.
+    try:
+        fh_meta = _extract_fixture_header_metadata(page)
+        rep.fixture_header_home_team = fh_meta.get("homeTeam") or ""
+        rep.fixture_header_away_team = fh_meta.get("awayTeam") or ""
+        rep.fixture_header_result_text = fh_meta.get("resultText") or ""
+    except Exception:
+        pass
 
-    toggles = _merge_innings_toggle_labels(
-        _discover_innings_toggle_labels(page),
-        _discover_innings_toggle_labels_broad(page),
-        _discover_innings_score_chips(page),
-    )
-    if not toggles:
-        toggles = _fallback_short_innings_labels(page)
-    rep.toggles = list(toggles)
-
-    mitcham_tabs = [t for t in toggles if _innings_is_mitcham(t)]
-    opp_tabs = [t for t in toggles if not _innings_is_mitcham(t)]
-    rep.innings_chips_detected = list(toggles)
-    rep.mitcham_innings_chips = list(mitcham_tabs)
-    rep.opposition_innings_chips = list(opp_tabs)
-
-    if toggles:
-        for lab in mitcham_tabs:
-            try:
-                _click_innings_toggle(page, lab)
-                rep.mitcham_batting_tabs_used.append(lab)
-                matrices = _all_scorecard_matrices(page)
-                bat_tables_total += _extend_batting_from_matrices(matrices, all_bat)
-            except Exception as e:
-                rep.note = (rep.note + f" bat_tab_err({lab}):{e!r};").strip()
-
-        bowling_dbg_best: dict[str, Any] | None = None
-        for lab in opp_tabs:
-            try:
-                _click_innings_toggle(page, lab)
-                rep.opposition_innings_for_bowling.append(lab)
-                matrices = _all_scorecard_matrices(page)
-                hit, bdbg = _extend_bowling_from_matrices(matrices, all_bowl)
-                bowl_tables_total += hit
-                if bdbg is not None and (
-                    bowling_dbg_best is None
-                    or bdbg["n_rows"] > bowling_dbg_best["n_rows"]
-                ):
-                    bowling_dbg_best = bdbg
-            except Exception as e:
-                rep.note = (rep.note + f" bowl_tab_err({lab}):{e!r};").strip()
-        if bowling_dbg_best is not None:
-            rep.bowling_header_row = bowling_dbg_best["header"]
-            rep.bowling_column_indices = bowling_dbg_best["indices"]
-            rep.bowling_expected_columns = bowling_dbg_best.get("expected_cols")
-            rep.bowling_raw_rows_first20 = bowling_dbg_best.get(
-                "raw_first20", []
-            )
-            rep.bowling_norm_rows_first20 = bowling_dbg_best.get(
-                "norm_first20", []
-            )
-
-    if (not toggles) or (not all_bat and not all_bowl):
-        hb, hbw = _parse_flat_scorecard_by_headings(page, all_bat, all_bowl)
-        bat_tables_total += hb
-        bowl_tables_total += hbw
-
-    if not all_bat:
-        bat_tables_total += _parse_scorecard_full_page_matrices_mitcham_batting(
-            page, all_bat
-        )
-
-    all_bat[:] = _dedupe_batting_rows(all_bat)
-    all_bowl[:] = _dedupe_bowling_rows(all_bowl)
-
-    rep.batting_tables_parsed = bat_tables_total
-    rep.bowling_tables_parsed = bowl_tables_total
-    rep.batting_rows = len(all_bat)
-    rep.bowling_rows = len(all_bowl)
-
-    if (
-        not rep.toggles
-        and rep.batting_tables_parsed == 0
-        and rep.bowling_tables_parsed == 0
-    ):
-        try:
-            _snapshot_scorecard_dom_when_empty(page, match_url, rep)
-        except Exception:
-            pass
-
-    # Match legacy full-parse order: page metadata after innings navigation.
+    # Try to capture blob/result lines if visible without Scorecard.
     try:
         meta = _extract_match_page_metadata(page)
         rep.raw_match_team_blob = (meta.get("blob") or "").strip()
@@ -3556,21 +4807,274 @@ def scrape_match_scorecard_batting_bowling(
     except Exception:
         pass
 
-    return all_bat, all_bowl, rep
+    return rep
+
+
+def scrape_match_scorecard_batting_bowling(
+    page: Page,
+    rep: ScorecardExtractReport,
+    *,
+    resolved: dict[str, Any] | None = None,
+    match_completed: bool = True,
+    extraction_mode: Literal["full", "partial"] = "full",
+    min_runs: int = 0,
+    min_wickets: int = 0,
+    enable_recovery_parsing: bool = False,
+    parse_batting: bool = True,
+    parse_bowling: bool = True,
+) -> tuple[list[BattingRow], list[BowlingRow], ScorecardExtractReport]:
+    """
+    Batting/bowling extraction only. Page must already be on this match's scorecard.
+
+    resolved: optional resolved fixture row (e.g. opponent) for incomplete chip detection.
+    match_completed: set False when status unknown (disables innings recovery heuristics).
+    extraction_mode: partial = earliest innings toggle only (split / in-progress games).
+    """
+    match_url = rep.match_url
+    t_norm0 = time.perf_counter()
+    all_bat: list[BattingRow] = []
+    all_bowl: list[BowlingRow] = []
+    bat_tables_total = 0
+    bowl_tables_total = 0
+
+    toggles = _merge_innings_toggle_labels(
+        _discover_innings_toggle_labels(page),
+        _discover_innings_toggle_labels_broad(page),
+        _discover_innings_score_chips(page),
+    )
+    if not toggles:
+        toggles = _fallback_short_innings_labels(page)
+    rep.toggles = list(toggles)
+    last_matrices: list[list[list[str]]] | None = None
+
+    mitcham_tabs = (
+        [
+            t
+            for t in toggles
+            if _innings_label_matches_resolved_mitcham_side(t, resolved, rep)
+        ]
+        if parse_batting
+        else []
+    )
+    opp_tabs = (
+        [
+            t
+            for t in toggles
+            if _innings_label_matches_resolved_opposition_bowling_tab(t, resolved, rep)
+        ]
+        if parse_bowling
+        else []
+    )
+    rep.innings_chips_detected = list(toggles)
+    rep.mitcham_innings_chips = list(mitcham_tabs)
+    rep.opposition_innings_chips = list(opp_tabs)
+
+    use_partial = extraction_mode == "partial"
+    if use_partial:
+        scope = select_partial_innings_scope(rep, completed_match=False)
+        sel = set(scope.get("selected_toggles") or [])
+        if sel:
+            mitcham_tabs = [t for t in mitcham_tabs if t in sel]
+            opp_tabs = [t for t in opp_tabs if t in sel]
+
+    if toggles and parse_batting:
+        for lab in mitcham_tabs:
+            try:
+                _click_innings_toggle(page, lab)
+                rep.mitcham_batting_tabs_used.append(lab)
+                matrices = _all_scorecard_matrices(page)
+                last_matrices = matrices
+                n_bat = len(all_bat)
+                bat_tables_total += _extend_batting_from_matrices(matrices, all_bat)
+                _tag_batting_slice(
+                    all_bat,
+                    n_bat,
+                    side_owner="mitcham",
+                    source_method="chip",
+                    source_confidence="high",
+                )
+            except Exception as e:
+                rep.note = (rep.note + f" bat_tab_err({lab}):{e!r};").strip()
+
+    if toggles and parse_bowling:
+        for lab in opp_tabs:
+            try:
+                _click_innings_toggle(page, lab)
+                rep.opposition_innings_for_bowling.append(lab)
+                matrices = _all_scorecard_matrices(page)
+                last_matrices = matrices
+                n_bowl = len(all_bowl)
+                hit, _bdbg = _extend_bowling_from_matrices(matrices, all_bowl)
+                _tag_bowling_slice(
+                    all_bowl,
+                    n_bowl,
+                    side_owner="mitcham",
+                    source_method="chip",
+                    source_confidence="high",
+                )
+                bowl_tables_total += hit
+            except Exception as e:
+                rep.note = (rep.note + f" bowl_tab_err({lab}):{e!r};").strip()
+
+    rep.normal_parse_sec = time.perf_counter() - t_norm0
+
+    if parse_batting and min_runs > 0:
+        all_bat = [
+            r for r in all_bat if r.side_owner == "mitcham" and r.runs >= min_runs
+        ]
+    if parse_bowling and min_wickets > 0:
+        all_bowl = [
+            r
+            for r in all_bowl
+            if r.side_owner == "mitcham" and r.wickets >= min_wickets
+        ]
+
+    has_bat_cand = bool(all_bat) if parse_batting else True
+    has_bowl_cand = bool(all_bowl) if parse_bowling else True
+    bat_ok = (not parse_batting) or has_bat_cand
+    bowl_ok = (not parse_bowling) or has_bowl_cand
+
+    def _finalize() -> tuple[list[BattingRow], list[BowlingRow], ScorecardExtractReport]:
+        all_bat[:] = _dedupe_batting_rows(all_bat)
+        all_bowl[:] = _dedupe_bowling_rows(all_bowl)
+        rep.batting_tables_parsed = bat_tables_total
+        rep.bowling_tables_parsed = bowl_tables_total
+        rep.batting_rows = len(all_bat)
+        rep.bowling_rows = len(all_bowl)
+        logger.info(
+            "[ScorecardParsed] url=%s bat_rows=%d bowl_rows=%d",
+            match_url,
+            len(all_bat),
+            len(all_bowl),
+        )
+        if (
+            not rep.toggles
+            and rep.batting_tables_parsed == 0
+            and rep.bowling_tables_parsed == 0
+        ):
+            try:
+                _snapshot_scorecard_dom_when_empty(page, match_url, rep)
+            except Exception:
+                pass
+        try:
+            meta = _extract_match_page_metadata(page)
+            rep.raw_match_team_blob = (meta.get("blob") or "").strip()
+            rep.scorecard_result_lines = list(meta.get("resultLines") or [])
+            rep.mitcham_team_from_page = meta.get("mitcham_from_blob")
+            rep.opponent_from_scorecard = meta.get("opponent_from_blob")
+        except Exception:
+            pass
+        return all_bat, all_bowl, rep
+
+    if not enable_recovery_parsing:
+        rep.fallback_parse_sec = 0.0
+        return _finalize()
+
+    if bat_ok and bowl_ok:
+        rep.fallback_parse_sec = 0.0
+        return _finalize()
+
+    t_fb0 = time.perf_counter()
+    need_bat = (not has_bat_cand) and parse_batting
+    need_bowl = (not has_bowl_cand) and parse_bowling
+    if not (rep.raw_match_team_blob or rep.scorecard_result_lines):
+        try:
+            meta = _extract_match_page_metadata(page)
+            rep.raw_match_team_blob = (meta.get("blob") or "").strip()
+            rep.scorecard_result_lines = list(meta.get("resultLines") or [])
+            rep.mitcham_team_from_page = meta.get("mitcham_from_blob")
+            rep.opponent_from_scorecard = meta.get("opponent_from_blob")
+        except Exception:
+            pass
+
+    if (
+        match_completed
+        and has_incomplete_completed_innings_discovery(
+            rep, resolved, match_completed=match_completed
+        )
+    ):
+        bb, bw, _fb_info = _innings_discovery_fallback_extract(
+            page,
+            match_url,
+            all_bat,
+            all_bowl,
+            resolved,
+            rep,
+            recover_batting=need_bat,
+            recover_bowling=need_bowl,
+            matrices=last_matrices,
+        )
+        if need_bat:
+            rep.used_batting_recovery = True
+        if need_bowl:
+            rep.used_bowling_recovery = True
+        bat_tables_total += bb
+        bowl_tables_total += bw
+        rep.note = (rep.note + " innings_recovery_fallback;").strip()
+    else:
+        hb, hbw = _parse_flat_scorecard_by_headings(
+            page,
+            all_bat,
+            all_bowl,
+            resolved,
+            rep,
+            include_batting=need_bat,
+            include_bowling=need_bowl,
+        )
+        if need_bat:
+            rep.used_batting_recovery = True
+        if need_bowl:
+            rep.used_bowling_recovery = True
+        bat_tables_total += hb
+        bowl_tables_total += hbw
+
+    if min_runs > 0 and need_bat:
+        all_bat = [
+            r for r in all_bat if r.side_owner == "mitcham" and r.runs >= min_runs
+        ]
+    if min_wickets > 0 and need_bowl:
+        all_bowl = [
+            r for r in all_bowl if r.side_owner == "mitcham" and r.wickets >= min_wickets
+        ]
+
+    rep.fallback_parse_sec = time.perf_counter() - t_fb0
+    rep.skipped_no_relevant_scope = False
+    return _finalize()
+
+
+def extract_partial_match_highlights(
+    page: Page,
+    rep: ScorecardExtractReport,
+    resolved: dict[str, Any] | None,
+) -> tuple[list[BattingRow], list[BowlingRow], ScorecardExtractReport]:
+    """Partial scorecard: earliest innings only; same row types as the full path."""
+    return scrape_match_scorecard_batting_bowling(
+        page,
+        rep,
+        resolved=resolved,
+        match_completed=False,
+        extraction_mode="partial",
+    )
 
 
 def scrape_match_scorecard(
     page: Page,
     match_url: str,
     match_date: date | None = None,
-) -> tuple[list[BattingRow], list[tuple[str, int, int]], ScorecardExtractReport]:
+) -> tuple[list[BattingRow], list[BowlingRow], ScorecardExtractReport]:
     """
     Full scorecard: metadata then batting/bowling (same behavior as before refactor).
     """
     rep = scrape_match_scorecard_metadata_only(page, match_url, match_date)
     if not rep.scorecard_reached:
         return [], [], rep
-    return scrape_match_scorecard_batting_bowling(page, rep)
+    return scrape_match_scorecard_batting_bowling(
+        page,
+        rep,
+        resolved=None,
+        match_completed=False,
+        extraction_mode="full",
+    )
 
 
 def _fallback_short_innings_labels(page: Page) -> list[str]:
@@ -3611,11 +5115,13 @@ def _top_batting_highlights(rows: list[BattingRow], n: int = 2) -> str:
     return "; ".join(format_batting_display(r) for r in rows_sorted[:n])
 
 
-def _top_bowling_highlights(bowls: list[tuple[str, int, int]], n: int = 2) -> str:
+def _top_bowling_highlights(bowls: list[BowlingRow], n: int = 2) -> str:
     if not bowls:
         return "—"
-    s = sorted(bowls, key=lambda x: (-x[1], x[2]))
-    return "; ".join(format_bowling_display(a, b, c) for a, b, c in s[:n])
+    s = sorted(bowls, key=lambda x: (-x.wickets, x.runs_conceded))
+    return "; ".join(
+        format_bowling_display(a.player, a.wickets, a.runs_conceded) for a in s[:n]
+    )
 
 
 def _better_bowl(
@@ -3629,13 +5135,23 @@ def _better_bowl(
     return current
 
 
+_SEASON_DROPDOWN_VISIBLE_RE = re.compile(
+    r"Summer\s+\d{4}/\d{2}",
+    flags=re.I,
+)
+
+
+def _norm_season_label(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
 def _open_club_season_dropdown(page: Page) -> None:
     """
     Open the PlayCricket club season control. Prefer the real trigger button so the
     options panel becomes visible (avoids clicking duplicate hidden option text).
     """
     wrap = page.locator(".o-dropdown__select-wrapper").filter(
-        has_text=re.compile(r"Summer\s+20")
+        has_text=_SEASON_DROPDOWN_VISIBLE_RE
     ).first
     trig = page.locator("#organisation-seasons").first
     try:
@@ -3663,19 +5179,74 @@ def _open_club_season_dropdown(page: Page) -> None:
 
 
 def _click_season_option_via_js(page: Page, season_label: str) -> bool:
-    """Click first visible element in the options panel whose text equals season_label."""
+    """
+    Click the season row in the open dropdown. Scrolls the list (virtualized / long
+    histories) so older seasons (e.g. Summer 2019/20) mount and become clickable.
+    """
+    want = _norm_season_label(season_label)
     return bool(
         page.evaluate(
             """(want) => {
           const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const wantN = norm(want);
+          const readLiLabel = (li) => {
+            const btn = li.querySelector('button.o-dropdown__item-trigger');
+            if (btn) {
+              const a = norm(btn.getAttribute('aria-label') || '');
+              if (a) return a;
+              return norm(btn.innerText || '');
+            }
+            return norm(li.innerText || '');
+          };
+          const clickLi = (li) => {
+            li.scrollIntoView({ block: 'center', inline: 'nearest' });
+            const btn = li.querySelector('button.o-dropdown__item-trigger');
+            if (btn) {
+              btn.click();
+              return true;
+            }
+            return false;
+          };
+          const scanList = (listEl) => {
+            if (!listEl) return false;
+            const step = Math.max(48, Math.floor(listEl.clientHeight * 0.45) || 80);
+            let maxH = listEl.scrollHeight;
+            for (let pass = 0; pass < 3; pass++) {
+              for (let top = 0; top <= maxH + step; top += step) {
+                listEl.scrollTop = Math.min(top, listEl.scrollHeight);
+                maxH = Math.max(maxH, listEl.scrollHeight);
+                const items = listEl.querySelectorAll('li.o-dropdown__options-item');
+                for (const li of items) {
+                  if (readLiLabel(li) !== wantN) continue;
+                  if (clickLi(li)) return true;
+                }
+              }
+              maxH = listEl.scrollHeight;
+            }
+            return false;
+          };
+          const list = document.querySelector('#organisation-seasons-options-list')
+            || document.querySelector('#organisation-seasons-options');
+          if (list && scanList(list)) return true;
           const roots = document.querySelectorAll(
             '#organisation-seasons-options, #organisation-seasons-options-list, .o-dropdown__options-wrapper'
           );
           for (const root of roots) {
             for (const el of root.querySelectorAll(
-              '[role="option"], button, a, li, span, div, label'
+              '[role="option"], button.o-dropdown__item-trigger, li.o-dropdown__options-item'
             )) {
-              if (norm(el.innerText) !== want) continue;
+              const t = norm(
+                el.getAttribute('aria-label') || el.innerText || ''
+              );
+              if (t !== wantN) continue;
+              el.scrollIntoView({ block: 'center', inline: 'nearest' });
+              const btn = el.tagName === 'BUTTON' && el.classList.contains('o-dropdown__item-trigger')
+                ? el
+                : el.querySelector('button.o-dropdown__item-trigger');
+              if (btn) {
+                btn.click();
+                return true;
+              }
               const r = el.getBoundingClientRect();
               const st = window.getComputedStyle(el);
               if (st.visibility === 'hidden' || st.display === 'none') continue;
@@ -3686,7 +5257,7 @@ def _click_season_option_via_js(page: Page, season_label: str) -> bool:
           }
           return false;
         }""",
-            season_label,
+            want,
         )
     )
 
@@ -3696,7 +5267,15 @@ def _click_season_in_open_dropdown(page: Page, season_label: str) -> None:
     Click the season row inside the open dropdown only (avoids strict-mode duplicate
     matches from page-wide get_by_text, which often resolves to a hidden list span).
     """
-    logger.info("[MitchamStats] _select_season: requested=%r", season_label)
+    label_n = _norm_season_label(season_label)
+    logger.info("[MitchamStats] _select_season: requested=%r", label_n)
+    if _click_season_option_via_js(page, label_n):
+        logger.info(
+            "[MitchamStats] _select_season: clicked ok container=%r for %r",
+            "js_scroll_virtualized_list",
+            label_n,
+        )
+        return
     attempts: list[tuple[str, Any]] = [
         ("#organisation-seasons-options", page.locator("#organisation-seasons-options")),
         ("#organisation-seasons-options-list", page.locator("#organisation-seasons-options-list")),
@@ -3713,7 +5292,7 @@ def _click_season_in_open_dropdown(page: Page, season_label: str) -> None:
             container.wait_for(state="visible", timeout=5_000)
         except Exception:
             continue
-        opt = container.get_by_text(season_label, exact=True)
+        opt = container.get_by_text(label_n, exact=True)
         try:
             if opt.count() == 0:
                 continue
@@ -3728,14 +5307,7 @@ def _click_season_in_open_dropdown(page: Page, season_label: str) -> None:
         logger.info(
             "[MitchamStats] _select_season: clicked ok container=%r for %r",
             desc,
-            season_label,
-        )
-        return
-    if _click_season_option_via_js(page, season_label):
-        logger.info(
-            "[MitchamStats] _select_season: clicked ok container=%r for %r",
-            "js_visible_option",
-            season_label,
+            label_n,
         )
         return
     raise TimeoutError(
@@ -3747,14 +5319,19 @@ def _select_season(page: Page, season_label: str) -> None:
     """Open club Teams tab and choose season from PlayCricket dropdown (controls team list)."""
     page.goto(f"{CLUB_PAGE}?tab=teams", wait_until="domcontentloaded", timeout=120_000)
     page.wait_for_timeout(900)
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(100)
+    except Exception:
+        pass
     wrap = page.locator(".o-dropdown__select-wrapper").filter(
-        has_text=re.compile(r"Summer\s+20")
+        has_text=_SEASON_DROPDOWN_VISIBLE_RE
     ).first
     try:
-        cur = re.sub(r"\s+", " ", wrap.inner_text(timeout=8000).strip())
+        cur = _norm_season_label(wrap.inner_text(timeout=8000))
     except Exception:
         cur = ""
-    if season_label in cur:
+    if _norm_season_label(season_label) in cur:
         return
     _open_club_season_dropdown(page)
     _click_season_in_open_dropdown(page, season_label)
@@ -3857,41 +5434,9 @@ def list_matches_for_team(page: Page, team: TeamRef) -> list[tuple[str, str]]:
     return out
 
 
-def _log_bowling_match_extraction(
-    rep: ScorecardExtractReport,
-    bowls: list[tuple[str, int, int]],
-    min_wickets: int,
-) -> None:
-    """Console/file debug for one match's bowling parse (completed matches)."""
-    idx = rep.bowling_column_indices
-    pi = wi = ri = None
-    if idx is not None:
-        pi, wi, ri = idx
-    msg = (
-        f"[BowlingExtraction] url={rep.match_url} "
-        f"innings_chips_detected={rep.innings_chips_detected!r} "
-        f"mitcham_innings_selected={rep.mitcham_batting_tabs_used!r} "
-        f"opposition_innings_selected={rep.opposition_innings_for_bowling!r} "
-        f"mitcham_chips={rep.mitcham_innings_chips!r} "
-        f"opposition_chips={rep.opposition_innings_chips!r} "
-        f"bowling_header={rep.bowling_header_row!r} "
-        f"expected_bowling_columns={rep.bowling_expected_columns!r} "
-        f"player_name_i={pi} wickets_i={wi} runs_conceded_i={ri} "
-        f"raw_rows_first20={rep.bowling_raw_rows_first20!r} "
-        f"norm_rows_first20={rep.bowling_norm_rows_first20!r} "
-        f"parsed_first20={bowls[:20]!r} total_bowling_rows={len(bowls)} "
-        f"min_wickets={min_wickets}"
-    )
-    if _env_truthy("MITCHAM_BOWLING_EXTRACTION_DEBUG"):
-        logger.info(msg)
-        try:
-            logf = Path(__file__).resolve().parent / "bowling_extraction.log"
-            with logf.open("a", encoding="utf-8") as fh:
-                fh.write(msg + "\n")
-        except Exception:
-            pass
-    else:
-        logger.debug(msg)
+#
+# Debug-only bowling extraction log removed.
+#
 
 
 def _log_fetch_scope(payload: dict[str, Any]) -> None:
@@ -3905,6 +5450,44 @@ def _log_fetch_scope(payload: dict[str, Any]) -> None:
         pass
 
 
+def _log_fetch_start(
+    season_label: str,
+    d_from: date,
+    d_to: date,
+    *,
+    include_juniors: bool,
+    include_seniors: bool,
+    fetch_scope_key: str,
+) -> None:
+    logger.info(
+        "[FetchStart] season=%r date_from=%s date_to=%s juniors_checked=%s "
+        "seniors_checked=%s fetch_scope_key=%r",
+        season_label,
+        d_from.isoformat(),
+        d_to.isoformat(),
+        include_juniors,
+        include_seniors,
+        fetch_scope_key,
+    )
+
+
+def _log_fetch_runtime_reset(
+    fetch_scope_key: str,
+    *,
+    cleared_transient_state: bool,
+    cleared_report: bool,
+    cleared_scorecard_cache: bool,
+    cleared_locator_state: bool,
+) -> None:
+    # Removed (debug-only / noisy).
+    return
+
+
+def _log_fresh_dom_query(action: str) -> None:
+    # Removed (debug-only / noisy).
+    return
+
+
 def _normalize_bowling_agg_tuple(
     t: tuple[str, int, int, str, str] | tuple[str, int, int, str, str, str],
 ) -> tuple[str, int, int, str, str, str]:
@@ -3912,6 +5495,40 @@ def _normalize_bowling_agg_tuple(
     if len(t) >= 6:
         return (t[0], t[1], t[2], t[3], t[4], str(t[5] or ""))
     return (t[0], t[1], t[2], t[3], t[4], "")
+
+
+def _scorecard_cache_matches_mode(
+    item: dict[str, Any],
+    rep_fin: ScorecardExtractReport,
+    d_from: date,
+    d_to: date,
+    status: str,
+    cand_mode: str,
+) -> bool:
+    window_partial, _ = is_partial_window_for_match(item, rep_fin, d_from, d_to)
+    completed_effective = (status == "Completed") and not window_partial
+    want_full = completed_effective
+    return (cand_mode == "full" and want_full) or (cand_mode == "partial" and not want_full)
+
+
+def _try_cached_scorecard_parse(
+    match_url: str,
+    item: dict[str, Any],
+    d_from: date,
+    d_to: date,
+    status: str,
+    scorecard_store: dict[
+        str, tuple[list[BattingRow], list[BowlingRow], ScorecardExtractReport]
+    ],
+) -> tuple[list[BattingRow], list[BowlingRow], ScorecardExtractReport] | None:
+    for cand in ("full", "partial"):
+        k = f"{match_url}||sc||{cand}"
+        if k not in scorecard_store:
+            continue
+        b, bow, rep_fin = scorecard_store[k]
+        if _scorecard_cache_matches_mode(item, rep_fin, d_from, d_to, status, cand):
+            return b, bow, rep_fin
+    return None
 
 
 def run_report(
@@ -3924,9 +5541,11 @@ def run_report(
     *,
     include_juniors: bool = True,
     include_seniors: bool = False,
+    include_scorecards: bool = True,
+    enable_recovery_parsing: bool = False,
     teams_cache: dict[str, list[TeamRef]] | None = None,
     scorecard_cache: dict[
-        str, tuple[list[BattingRow], list[tuple[str, int, int]], ScorecardExtractReport]
+        str, tuple[list[BattingRow], list[BowlingRow], ScorecardExtractReport]
     ]
     | None = None,
     progress_callback: Callable[[str], None] | None = None,
@@ -3938,18 +5557,23 @@ def run_report(
     d_to = max(date_from, date_to)
     fetch_scope_key = (
         f"{season_label}|{d_from.isoformat()}|{d_to.isoformat()}"
-        f"|{int(include_juniors)}|{int(include_seniors)}"
+        f"|{int(include_juniors)}|{int(include_seniors)}|{int(include_scorecards)}"
+        f"|{int(enable_recovery_parsing)}"
     )
-    logger.info(
-        "[FetchScopeReset] season=%r date_from=%r date_to=%r juniors_checked=%s "
-        "seniors_checked=%s fetch_scope_key=%r accumulators=batting_highlights,"
-        "bowling_highlights,match_rows,all_bowling_agg (fresh per run)",
+    _log_fetch_start(
         season_label,
-        d_from.isoformat(),
-        d_to.isoformat(),
-        include_juniors,
-        include_seniors,
+        d_from,
+        d_to,
+        include_juniors=include_juniors,
+        include_seniors=include_seniors,
+        fetch_scope_key=fetch_scope_key,
+    )
+    _log_fetch_runtime_reset(
         fetch_scope_key,
+        cleared_transient_state=True,
+        cleared_report=False,
+        cleared_scorecard_cache=False,
+        cleared_locator_state=True,
     )
     batting_highlights: list[dict[str, Any]] = []
     bowling_highlights: list[dict[str, Any]] = []
@@ -3970,31 +5594,37 @@ def run_report(
     scorecard_store = scorecard_cache if scorecard_cache is not None else {}
     cache_key = season_label
     t_total = time.perf_counter()
+    match_discovery_sec = 0.0
+    scorecard_parse_sec = 0.0
+    scorecards_attempted = 0
+    scorecards_parsed_normal_only = 0
+    scorecards_with_recovery = 0
+    scorecards_skipped_invalid = 0
+    scorecards_skipped_abandoned = 0
+    scorecards_skipped_results_only = 0
+    scorecards_skipped_no_relevant_scope = 0
+    scorecards_from_cache_full = 0
+    scorecards_from_cache_partial = 0
     selected_teams: list[TeamRef] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
+        context = browser.new_context()
+        page = context.new_page()
         try:
             t0 = time.perf_counter()
             if cache_key in cache:
                 all_teams = cache[cache_key]
-                prog("Using cached club teams for this season…")
-                logger.info(
-                    "Team list: cache hit key=%r (%d teams)",
-                    cache_key,
-                    len(all_teams),
-                )
+                prog("Syncing club page season (cached team list)…")
+                _log_fresh_dom_query("season_select")
+                _select_season(page, season_label)
             else:
                 prog("Selecting season and loading club teams…")
+                _log_fresh_dom_query("season_select")
                 _select_season(page, season_label)
+                _log_fresh_dom_query("team_discovery")
                 all_teams = discover_teams_from_page(page)
                 cache[cache_key] = all_teams
-                logger.info(
-                    "Team list: cached %d teams for season key=%r",
-                    len(all_teams),
-                    cache_key,
-                )
             _perf("team discovery", t0)
 
             n_jr_all = sum(1 for t in all_teams if classify_team_label(t.label) == "junior")
@@ -4038,23 +5668,40 @@ def run_report(
             per_team_raw_matches: dict[str, int] = {}
             t1 = time.perf_counter()
             prog(f"Scanning fixtures ({len(selected_teams)} teams)…")
+            _log_fresh_dom_query("match_list")
             match_discovery_attempts = 0
+            prev_count: int | None = None
             for attempt in range(3):
                 for team in selected_teams:
                     tc = classify_team_label(team.label)
                     pairs = list_matches_for_team(page, team)
                     if attempt == 0:
                         per_team_raw_matches[team.label] = len(pairs)
-                        logger.info(
-                            "[TeamFixtureDiscovery] current_team_label=%r "
-                            "current_team_category=%r raw_matches_found=%d",
-                            team.label,
-                            tc,
-                            len(pairs),
-                        )
                     for match_url, card in pairs:
                         md = _parse_first_match_date(card)
-                        if md is None or md < d_from or md > d_to:
+                        overlap, overlap_dbg = fixture_overlaps_selected_window(
+                            {"md": md, "team_category": tc}, card, d_from, d_to
+                        )
+                        _log_fixture_window_overlap(
+                            match_url,
+                            d_from,
+                            d_to,
+                            team_category=overlap_dbg.get("team_category"),
+                            multi_day_type_detected=overlap_dbg.get(
+                                "multi_day_type_detected"
+                            ),
+                            used_fallback_second_day=bool(
+                                overlap_dbg.get("used_fallback_second_day")
+                            ),
+                            fallback_second_day=overlap_dbg.get("fallback_second_day"),
+                            primary_match_date=overlap_dbg.get("primary_match_date"),
+                            scheduled_dates_detected=list(
+                                overlap_dbg.get("scheduled_dates_detected") or []
+                            ),
+                            overlap_result=overlap,
+                            overlap_reason=overlap_dbg.get("overlap_reason"),
+                        )
+                        if not overlap:
                             continue
                         if match_url in by_url:
                             continue
@@ -4074,20 +5721,18 @@ def run_report(
                         }
                 c_now = len(by_url)
                 match_discovery_attempts = attempt + 1
-                logger.info(
-                    "match_count_attempt_%d=%d",
-                    attempt + 1,
-                    c_now,
-                )
+                if prev_count is not None and c_now == prev_count:
+                    break
+                prev_count = c_now
                 if attempt < 2:
                     page.wait_for_timeout(400)
-            logger.info("final_match_count=%d", len(by_url))
             _perf("match discovery (date-filtered)", t1)
 
             ordered = sorted(
                 by_url.values(),
                 key=lambda x: (x["md"] or date.min, x["match_url"]),
             )
+            match_discovery_sec = time.perf_counter() - t1
             n_m = len(ordered)
             n_matches_junior = sum(
                 1 for x in ordered if x.get("team_category") == "junior"
@@ -4110,10 +5755,16 @@ def run_report(
                     "matches_senior_women": n_matches_senior_women,
                 }
             )
-            prog(f"Loading {n_m} scorecards…")
+            prog(
+                f"Loading {n_m} scorecards…"
+                if include_scorecards
+                else f"Processing {n_m} matches (fixtures only)…"
+            )
+            _log_fresh_dom_query("scorecard_tab")
             t2 = time.perf_counter()
             team_accepted: dict[str, int] = defaultdict(int)
             team_rejected: dict[str, int] = defaultdict(int)
+            scorecard_parse_sec = 0.0
             for i, item in enumerate(ordered):
                 match_url = item["match_url"]
                 md: date = item["md"]
@@ -4121,107 +5772,309 @@ def run_report(
                 oc = item["oc"]
                 disc_lab = item.get("discovered_team_label") or ""
 
-                _rep = scrape_match_scorecard_metadata_only(page, match_url, md)
-                resolved_pre = _resolve_match_row_fields(item, _rep)
-                ok, rej = is_valid_mitcham_match(
-                    _rep, resolved_pre, item.get("card") or ""
-                )
-                _log_match_validation(
-                    match_url, disc_lab, _rep, resolved_pre, ok, rej
-                )
-                if not ok:
-                    team_rejected[disc_lab] += 1
-                    if n_m and (i + 1) % max(1, n_m // 8) == 0:
-                        prog(f"Scorecards {i + 1}/{n_m}…")
-                    continue
-
-                team_accepted[disc_lab] += 1
-
+                window_partial = False
+                window_dbg: dict[str, Any] = {}
                 bats: list[BattingRow] = []
-                bowls: list[tuple[str, int, int]] = []
-                _rep_final: ScorecardExtractReport = _rep
-                if status == "Completed":
-                    if match_url in scorecard_store:
-                        bats, bowls, _rep_final = scorecard_store[match_url]
-                    else:
-                        bats, bowls, _rep_final = (
-                            scrape_match_scorecard_batting_bowling(page, _rep)
-                        )
-                        scorecard_store[match_url] = (bats, bowls, _rep_final)
-                    resolved = _resolve_match_row_fields(item, _rep_final)
-                else:
-                    resolved = resolved_pre
+                bowls: list[BowlingRow] = []
+                track_parse_counters = False
+                _rep_final: ScorecardExtractReport
 
-                if status == "Completed":
+                if not include_scorecards:
+                    _rep = _open_match_summary_without_scorecard(page, match_url, md)
+                    window_partial, window_dbg = is_partial_window_for_match(
+                        item, _rep, d_from, d_to
+                    )
+                    resolved_pre = _resolve_match_row_fields(item, _rep)
+                    ok, rej = is_valid_mitcham_match(
+                        _rep, resolved_pre, item.get("card") or ""
+                    )
+                    if not ok:
+                        scorecards_skipped_invalid += 1
+                        team_rejected[disc_lab] += 1
+                        if n_m and (i + 1) % max(1, n_m // 8) == 0:
+                            prog(f"Matches {i + 1}/{n_m}…")
+                        continue
+                    team_accepted[disc_lab] += 1
+                    scorecards_skipped_results_only += 1
+                    _rep_final = _rep
+                    resolved = _resolve_match_row_fields(item, _rep_final)
+
+                elif status == "Abandoned":
+                    _rep = _open_match_summary_without_scorecard(page, match_url, md)
+                    window_partial, window_dbg = is_partial_window_for_match(
+                        item, _rep, d_from, d_to
+                    )
+                    resolved_pre = _resolve_match_row_fields(item, _rep)
+                    ok, rej = is_valid_mitcham_match(
+                        _rep, resolved_pre, item.get("card") or ""
+                    )
+                    if not ok:
+                        scorecards_skipped_invalid += 1
+                        team_rejected[disc_lab] += 1
+                        if n_m and (i + 1) % max(1, n_m // 8) == 0:
+                            prog(f"Scorecards {i + 1}/{n_m}…")
+                        continue
+                    team_accepted[disc_lab] += 1
+                    scorecards_skipped_abandoned += 1
+                    _rep_final = _rep
+                    resolved = _resolve_match_row_fields(item, _rep_final)
+
+                else:
+                    track_parse_counters = True
+                    cached = _try_cached_scorecard_parse(
+                        match_url, item, d_from, d_to, status, scorecard_store
+                    )
+                    if cached is not None:
+                        team_accepted[disc_lab] += 1
+                        scorecards_attempted += 1
+                        bats, bowls, _rep_final = cached
+                        window_partial, window_dbg = is_partial_window_for_match(
+                            item, _rep_final, d_from, d_to
+                        )
+                        completed_effective = (status == "Completed") and not window_partial
+                        if completed_effective:
+                            scorecards_from_cache_full += 1
+                        else:
+                            scorecards_from_cache_partial += 1
+                        resolved = _resolve_match_row_fields(item, _rep_final)
+                        cache_sc_key = f"{match_url}||sc||{'full' if completed_effective else 'partial'}"
+                        if (
+                            enable_recovery_parsing
+                            and completed_effective
+                            and not bats
+                            and (resolved.get("mitcham_team") or "").strip()
+                            and not _rep_final.used_batting_recovery
+                        ):
+                            t_sc1 = time.perf_counter()
+                            rec, _br_dbg = _attempt_full_page_mitcham_batting_recovery(
+                                page,
+                                _rep_final,
+                                resolved,
+                                min_runs=min_runs,
+                                match_url=match_url,
+                            )
+                            scorecard_parse_sec += time.perf_counter() - t_sc1
+                            if rec:
+                                bats = rec
+                                scorecard_store[cache_sc_key] = (
+                                    bats,
+                                    bowls,
+                                    _rep_final,
+                                )
+                                _rep_final.note = (
+                                    (_rep_final.note or "")
+                                    + " full_page_batting_recovery;"
+                                ).strip()
+                    else:
+                        _rep_sc = scrape_match_scorecard_metadata_only(
+                            page, match_url, md
+                        )
+                        window_partial, window_dbg = is_partial_window_for_match(
+                            item, _rep_sc, d_from, d_to
+                        )
+                        resolved_pre = _resolve_match_row_fields(item, _rep_sc)
+                        ok, rej = is_valid_mitcham_match(
+                            _rep_sc, resolved_pre, item.get("card") or ""
+                        )
+                        if not ok:
+                            scorecards_skipped_invalid += 1
+                            team_rejected[disc_lab] += 1
+                            if n_m and (i + 1) % max(1, n_m // 8) == 0:
+                                prog(f"Scorecards {i + 1}/{n_m}…")
+                            continue
+                        team_accepted[disc_lab] += 1
+
+                        completed_effective = (status == "Completed") and not window_partial
+                        needed_mode = "full" if completed_effective else "partial"
+                        cache_sc_key = f"{match_url}||sc||{needed_mode}"
+
+                        scorecards_attempted += 1
+                        t_sc0 = time.perf_counter()
+                        bats, bowls, _rep_final = scrape_match_scorecard_batting_bowling(
+                            page,
+                            _rep_sc,
+                            resolved=resolved_pre,
+                            match_completed=completed_effective,
+                            extraction_mode="full"
+                            if completed_effective
+                            else "partial",
+                            min_runs=min_runs,
+                            min_wickets=min_wickets,
+                            enable_recovery_parsing=enable_recovery_parsing,
+                        )
+                        scorecard_parse_sec += time.perf_counter() - t_sc0
+                        scorecard_store[cache_sc_key] = (bats, bowls, _rep_final)
+                        resolved = _resolve_match_row_fields(item, _rep_final)
+                        if (
+                            enable_recovery_parsing
+                            and completed_effective
+                            and not bats
+                            and (resolved.get("mitcham_team") or "").strip()
+                            and not _rep_final.used_batting_recovery
+                        ):
+                            t_sc1 = time.perf_counter()
+                            rec, _br_dbg = _attempt_full_page_mitcham_batting_recovery(
+                                page,
+                                _rep_final,
+                                resolved,
+                                min_runs=min_runs,
+                                match_url=match_url,
+                            )
+                            scorecard_parse_sec += time.perf_counter() - t_sc1
+                            if rec:
+                                bats = rec
+                                scorecard_store[cache_sc_key] = (
+                                    bats,
+                                    bowls,
+                                    _rep_final,
+                                )
+                                _rep_final.note = (
+                                    (_rep_final.note or "")
+                                    + " full_page_batting_recovery;"
+                                ).strip()
+
+                extraction_mode_logged = (
+                    "full"
+                    if (status == "Completed") and not window_partial
+                    else "partial"
+                )
+
+                if track_parse_counters:
+                    if (
+                        _rep_final.used_batting_recovery
+                        or _rep_final.used_bowling_recovery
+                    ):
+                        scorecards_with_recovery += 1
+                    else:
+                        scorecards_parsed_normal_only += 1
+
+                resolved["scheduled_dates_detected"] = window_dbg.get(
+                    "scheduled_dates_detected"
+                )
+                resolved["multi_day_type_detected"] = window_dbg.get(
+                    "multi_day_type_detected"
+                )
+                resolved["partial_window_reason"] = window_dbg.get(
+                    "partial_window_reason"
+                )
+                if window_partial and status != "Abandoned":
+                    resolved["result"] = "In Progress"
+                    resolved["display_status"] = "In Progress"
+                    resolved["window_partial_for_range"] = True
+
+                if window_partial:
+                    in_progress += 1
+                elif status == "Completed":
                     if oc == "win":
                         wins += 1
                     elif oc == "loss":
                         losses += 1
                     elif oc == "draw":
                         draws += 1
-                elif status == "In progress":
+                elif status != "Abandoned":
                     in_progress += 1
 
                 ds = md.isoformat() if md else ""
-                if status == "Completed":
-                    _log_scorecard_report(_rep_final)
-                    if _env_truthy("MITCHAM_SCORECARD_DEBUG"):
-                        logger.info(
-                            "[ScorecardInningsChips] detected=%r mitcham=%r opposition=%r",
-                            _rep_final.innings_chips_detected,
-                            _rep_final.mitcham_innings_chips,
-                            _rep_final.opposition_innings_chips,
-                        )
-                    _log_bowling_match_extraction(_rep_final, bowls, min_wickets)
-                    agg_bat_rows += len(bats)
-                    agg_bowl_rows += len(bowls)
-                    agg_bat_pass_min += sum(1 for br in bats if br.runs >= min_runs)
-                    mt = str(resolved.get("mitcham_team") or "").strip() or "Mitcham"
-                    for br in bats:
-                        if br.runs >= min_runs:
-                            batting_highlights.append(
-                                {
-                                    "date": ds,
-                                    "player": br.player,
-                                    "runs": br.runs,
-                                    "balls": br.balls,
-                                    "not_out": br.not_out,
-                                    "formatted": format_batting_display(br),
-                                    "match_url": match_url,
-                                    "mitcham_team": mt,
-                                }
-                            )
-                    for name, wkts, runs_con in bowls:
-                        all_bowling_agg.append(
-                            (name, wkts, runs_con, ds, match_url, mt)
-                        )
+                partial_window_match = window_partial or (
+                    status not in ("Completed", "Abandoned")
+                    and md is not None
+                    and d_from <= md <= d_to
+                )
+                resolved["partial_window_match"] = partial_window_match
 
+                agg_bat_rows += len(bats)
+                agg_bowl_rows += len(bowls)
+                agg_bat_pass_min += sum(
+                    1
+                    for br in bats
+                    if br.runs >= min_runs and br.side_owner == "mitcham"
+                )
+                mt = str(resolved.get("mitcham_team") or "").strip() or "Mitcham"
+                if include_scorecards:
+                    _log_match_highlight_contribution(
+                        match_url, mt, bats, bowls, min_runs, min_wickets
+                    )
+                for br in bats:
+                    if br.runs >= min_runs:
+                        if br.side_owner != "mitcham":
+                            _log_highlight_guard_rail(
+                                url=match_url,
+                                mitcham_team=mt,
+                                player_name=br.player,
+                                side_owner=br.side_owner,
+                                source_method=br.source_method,
+                                reason="side_owner_not_mitcham",
+                            )
+                            continue
+                        batting_highlights.append(
+                            {
+                                "date": ds,
+                                "player": br.player,
+                                "runs": br.runs,
+                                "balls": br.balls,
+                                "not_out": br.not_out,
+                                "formatted": format_batting_display(br),
+                                "match_url": match_url,
+                                "mitcham_team": mt,
+                            }
+                        )
+                for bowl in bowls:
+                    if bowl.wickets >= min_wickets and bowl.side_owner != "mitcham":
+                        _log_highlight_guard_rail(
+                            url=match_url,
+                            mitcham_team=mt,
+                            player_name=bowl.player,
+                            side_owner=bowl.side_owner,
+                            source_method=bowl.source_method,
+                            reason="side_owner_not_mitcham",
+                        )
+                    if bowl.side_owner != "mitcham":
+                        continue
+                    all_bowling_agg.append(
+                        (bowl.player, bowl.wickets, bowl.runs_conceded, ds, match_url, mt)
+                    )
+
+                disp_st = (
+                    resolved.get("display_status")
+                    or normalize_card_status_for_ui(status)
+                )
                 match_rows.append(
                     {
                         "date": ds,
                         "mitcham_team": resolved["mitcham_team"],
                         "opponent": resolved["opponent"],
-                        "status": status,
+                        "status": disp_st,
                         "result": resolved["result"],
                         "match_url": match_url,
+                        "partial_window_match": partial_window_match,
                     }
                 )
                 _log_match_results_row(match_url, resolved, status)
                 if n_m and (i + 1) % max(1, n_m // 8) == 0:
-                    prog(f"Scorecards {i + 1}/{n_m}…")
+                    prog(
+                        f"Scorecards {i + 1}/{n_m}…"
+                        if include_scorecards
+                        else f"Matches {i + 1}/{n_m}…"
+                    )
 
-            for team in selected_teams:
-                lab = team.label
-                logger.info(
-                    "[TeamFixtureDiscovery] summary current_team_label=%r "
-                    "raw_matches_found=%d accepted_matches=%d "
-                    "rejected_non_mitcham_matches=%d",
-                    lab,
-                    per_team_raw_matches.get(lab, 0),
-                    team_accepted.get(lab, 0),
-                    team_rejected.get(lab, 0),
-                )
-            agg_bowl_pass_min = sum(1 for t in all_bowling_agg if t[1] >= min_wickets)
+                if track_parse_counters and (
+                    float(getattr(_rep_final, "normal_parse_sec", 0.0) or 0.0) > 4.0
+                    or float(getattr(_rep_final, "fallback_parse_sec", 0.0) or 0.0) > 2.0
+                ):
+                    logger.warning(
+                        "[SlowScorecard] url=%s normal_parse_sec=%.3f fallback_sec=%.3f "
+                        "status=%s final_mitcham_team=%r extraction_mode=%s",
+                        match_url,
+                        float(getattr(_rep_final, "normal_parse_sec", 0.0) or 0.0),
+                        float(getattr(_rep_final, "fallback_parse_sec", 0.0) or 0.0),
+                        status,
+                        str(resolved.get("mitcham_team") or ""),
+                        extraction_mode_logged,
+                    )
+
+            agg_bowl_pass_min = sum(
+                1 for t in all_bowling_agg if t[1] >= min_wickets
+            )
             _perf("scorecard parsing (total)", t2)
             logger.info(
                 "[ScorecardAggregate] total_batting_rows=%d total_bowling_rows=%d "
@@ -4233,16 +6086,15 @@ def run_report(
                 min_wickets,
                 agg_bowl_pass_min,
             )
-            _scorecard_extract_log(
-                "AGGREGATE | "
-                f"total_batting_rows={agg_bat_rows} total_bowling_rows={agg_bowl_rows} "
-                f"batting_pass_min_runs_{min_runs}={agg_bat_pass_min} "
-                f"bowling_pass_min_wickets_{min_wickets}={agg_bowl_pass_min}"
-            )
         finally:
-            browser.close()
-
-    all_bowling_agg = [_normalize_bowling_agg_tuple(t) for t in all_bowling_agg]
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     bowling_highlights = [
         {
@@ -4260,31 +6112,13 @@ def run_report(
     for t in all_bowling_agg:
         if t[1] >= min_wickets:
             best_bowl = _better_bowl(best_bowl, t[0], t[1], t[2])
-    _filt20 = [x for x in all_bowling_agg if x[1] >= min_wickets][:20]
-    _disp20 = [
-        format_bowling_display(name, w, r)
-        for name, w, r, _ds, _u, _mt in _filt20
-    ]
-    _bowl_agg_msg = (
-        f"[BowlingAggregate] total_bowling_rows={len(all_bowling_agg)} "
-        f"min_wickets={min_wickets} first20_agg={all_bowling_agg[:20]!r} "
-        f"first20_after_filter={_filt20!r} display_strings={_disp20!r}"
-    )
-    if _env_truthy("MITCHAM_BOWLING_EXTRACTION_DEBUG"):
-        logger.info(_bowl_agg_msg)
-    else:
-        logger.debug(_bowl_agg_msg)
-    if _env_truthy("MITCHAM_BOWLING_EXTRACTION_DEBUG"):
-        try:
-            logf = Path(__file__).resolve().parent / "bowling_extraction.log"
-            with logf.open("a", encoding="utf-8") as fh:
-                fh.write(
-                    f"[BowlingAggregate] total={len(all_bowling_agg)} "
-                    f"filtered={agg_bowl_pass_min} min_wk={min_wickets}\n"
-                )
-        except Exception:
-            pass
+    # Removed verbose bowling aggregate debug logging.
 
+    _total_fetch_sec = time.perf_counter() - t_total
+    logger.info("[Perf] include_scorecards=%s", include_scorecards)
+    logger.info("[Perf] match_discovery_sec=%.3f", match_discovery_sec)
+    logger.info("[Perf] scorecard_parse_sec=%.3f", scorecard_parse_sec)
+    logger.info("[Perf] total_fetch_sec=%.3f", _total_fetch_sec)
     _perf("total fetch", t_total)
 
     batting_highlights.sort(
@@ -4304,6 +6138,15 @@ def run_report(
         )
     )
     match_rows.sort(key=lambda r: (r["date"] or "", r["mitcham_team"]))
+
+    grouped_batting_highlights = group_highlights_by_mitcham_team(batting_highlights)
+    grouped_bowling_highlights = group_highlights_by_mitcham_team(bowling_highlights)
+    _log_highlight_final_counts(
+        batting_highlights,
+        bowling_highlights,
+        grouped_batting_highlights,
+        grouped_bowling_highlights,
+    )
 
     completed_finished = wins + losses + draws
     if include_juniors and include_seniors:
@@ -4343,6 +6186,17 @@ def run_report(
         "min_wickets": min_wickets,
         "include_juniors": include_juniors,
         "include_seniors": include_seniors,
+        "include_scorecards": include_scorecards,
+        "enable_recovery_parsing": enable_recovery_parsing,
+        "scorecards_attempted": scorecards_attempted,
+        "scorecards_parsed_normal_only": scorecards_parsed_normal_only,
+        "scorecards_with_recovery": scorecards_with_recovery,
+        "scorecards_skipped_invalid": scorecards_skipped_invalid,
+        "scorecards_skipped_abandoned": scorecards_skipped_abandoned,
+        "scorecards_skipped_results_only": scorecards_skipped_results_only,
+        "scorecards_skipped_no_relevant_scope": scorecards_skipped_no_relevant_scope,
+        "scorecards_from_cache_full": scorecards_from_cache_full,
+        "scorecards_from_cache_partial": scorecards_from_cache_partial,
         "scope": scope,
         "junior_teams": [
             {"label": t.label, "url": t.grade_url} for t in junior_only_selected
@@ -4367,6 +6221,8 @@ def run_report(
         "matches_in_range": len(match_rows),
         "batting_highlights": batting_highlights,
         "bowling_highlights": bowling_highlights,
+        "grouped_batting_highlights": grouped_batting_highlights,
+        "grouped_bowling_highlights": grouped_bowling_highlights,
         "best_bowl": best_bowl,
         "match_rows": match_rows,
     }
@@ -4435,13 +6291,16 @@ def _facebook_match_result_line(row: dict[str, Any]) -> str | None:
     return line
 
 
-def _facebook_batting_lines(bh: list[dict[str, Any]], limit: int = 30) -> list[str]:
+def _facebook_batting_lines(
+    bh: list[dict[str, Any]], *, limit: int | None = 30
+) -> list[str]:
     rows = sorted(
         bh,
         key=lambda r: (-int(r.get("runs") or 0), str(r.get("player") or "").lower()),
     )
+    capped = rows if limit is None else rows[:limit]
     out: list[str] = []
-    for r in rows[:limit]:
+    for r in capped:
         name = str(r.get("player") or "").strip()
         runs = int(r.get("runs") or 0)
         if not name:
@@ -4451,7 +6310,9 @@ def _facebook_batting_lines(bh: list[dict[str, Any]], limit: int = 30) -> list[s
     return out
 
 
-def _facebook_bowling_combined_lines(bo: list[dict[str, Any]], limit: int = 30) -> list[str]:
+def _facebook_bowling_combined_lines(
+    bo: list[dict[str, Any]], *, limit: int | None = 30
+) -> list[str]:
     """Same player, multiple spells: 'Name 3/22 & 2/18'. Sort by best spell: wickets desc, runs asc."""
     by_player: dict[str, list[tuple[int, int]]] = {}
     for r in bo:
@@ -4468,7 +6329,8 @@ def _facebook_bowling_combined_lines(bo: list[dict[str, Any]], limit: int = 30) 
         best_w, best_r = spells_sorted[0]
         ranked.append((best_w, best_r, name, f"{name} {fig}"))
     ranked.sort(key=lambda x: (-x[0], x[1], x[2].lower()))
-    return [x[3] for x in ranked[:limit]]
+    capped = ranked if limit is None else ranked[:limit]
+    return [x[3] for x in capped]
 
 
 def _facebook_wrap_title(data: dict[str, Any]) -> str:
@@ -4513,23 +6375,39 @@ def facebook_summary(data: dict[str, Any]) -> str:
     else:
         lines.append("—")
 
-    bh = list(data.get("batting_highlights") or [])
-    bo_rows = list(data.get("bowling_highlights") or [])
+    bat_flat = _flatten_grouped_highlight_entries(
+        data.get("grouped_batting_highlights")
+    )
+    bowl_flat = _flatten_grouped_highlight_entries(
+        data.get("grouped_bowling_highlights")
+    )
+    bh = (
+        bat_flat
+        if bat_flat is not None
+        else list(data.get("batting_highlights") or [])
+    )
+    bo_rows = (
+        bowl_flat
+        if bowl_flat is not None
+        else list(data.get("bowling_highlights") or [])
+    )
 
-    lines.append("")
-    lines.append("Best with the ball:")
-    bbowl = _facebook_bowling_combined_lines(bo_rows)
-    if bbowl:
-        lines.append(", ".join(bbowl))
-    else:
-        lines.append("—")
+    if bo_rows:
+        lines.append("")
+        lines.append("Best with the ball:")
+        bbowl = _facebook_bowling_combined_lines(bo_rows, limit=None)
+        if bbowl:
+            lines.append(", ".join(bbowl))
+        else:
+            lines.append("—")
 
-    lines.append("")
-    lines.append("Best with the bat:")
-    bbat = _facebook_batting_lines(bh)
-    if bbat:
-        lines.append(", ".join(bbat))
-    else:
-        lines.append("—")
+    if bh:
+        lines.append("")
+        lines.append("Best with the bat:")
+        bbat = _facebook_batting_lines(bh, limit=None)
+        if bbat:
+            lines.append(", ".join(bbat))
+        else:
+            lines.append("—")
 
     return "\n".join(lines)
