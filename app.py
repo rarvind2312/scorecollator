@@ -7,6 +7,8 @@ import logging
 import calendar
 import html
 import re
+import subprocess
+import sys
 from datetime import date
 from itertools import groupby
 from pathlib import Path
@@ -14,6 +16,22 @@ from typing import Any, Literal, Optional
 
 import pandas as pd
 import streamlit as st
+
+
+def _ensure_playwright_chromium() -> None:
+    """Ensure Playwright Chromium is installed (e.g. Streamlit Cloud missing ~/.cache/ms-playwright)."""
+    cache = Path.home() / ".cache" / "ms-playwright"
+    if cache.is_dir():
+        for entry in cache.iterdir():
+            if entry.is_dir() and entry.name.startswith("chromium"):
+                return
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+    )
+
+
+_ensure_playwright_chromium()
 
 from scraper import (
     default_season_choices,
