@@ -4191,7 +4191,7 @@ def _innings_team_token(label: str) -> str | None:
 
 
 _SCORE_CHIP_LABEL_RE = re.compile(
-    r"^(?i)(?P<code>[A-Z]{2,4})\s+(?P<a>\d+)\s*[-/]\s*(?P<b>\d+)\s*$"
+    r"(?i)^(?P<code>[A-Z]{2,4})\s+(?P<a>\d+)\s*[-/]\s*(?P<b>\d+)\s*$"
 )
 
 
