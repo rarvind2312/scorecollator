@@ -1,0 +1,9 @@
+# Optional: Render Blueprint — Docker web service
+services:
+  - type: web
+    name: playcricketdata
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
