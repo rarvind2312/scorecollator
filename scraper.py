@@ -6294,19 +6294,32 @@ def _facebook_match_result_line(row: dict[str, Any]) -> str | None:
 def _facebook_batting_lines(
     bh: list[dict[str, Any]], *, limit: int | None = 30
 ) -> list[str]:
+    """Comma-list lines; same player + multiple innings -> 'Name 24 & 20' (order = sorted rows)."""
     rows = sorted(
         bh,
         key=lambda r: (-int(r.get("runs") or 0), str(r.get("player") or "").lower()),
     )
     capped = rows if limit is None else rows[:limit]
-    out: list[str] = []
+    order: list[str] = []
+    by_name: dict[str, list[str]] = {}
     for r in capped:
         name = str(r.get("player") or "").strip()
         runs = int(r.get("runs") or 0)
         if not name:
             continue
         suffix = " no" if r.get("not_out") else ""
-        out.append(f"{name} {runs}{suffix}")
+        stat = f"{runs}{suffix}"
+        if name not in by_name:
+            order.append(name)
+            by_name[name] = []
+        by_name[name].append(stat)
+    out: list[str] = []
+    for name in order:
+        stats = by_name[name]
+        if len(stats) == 1:
+            out.append(f"{name} {stats[0]}")
+        else:
+            out.append(f"{name} " + " & ".join(stats))
     return out
 
 
